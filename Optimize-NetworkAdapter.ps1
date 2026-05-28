@@ -87,61 +87,138 @@
 
 [CmdletBinding()]
 param(
+    # Restore previous adapter settings from JSON backup
     [switch]$Restore,
+
+    # Optimize ALL active Ethernet adapters without prompting
     [switch]$All,
+
+    # Specific adapter name (skips interactive selection)
     [string]$AdapterName,
 
-    # === TRYBY PRACY ===
-    # Throughput   = max przepustowosc (download/upload, streaming, file transfer)
-    # LowLatency   = min ping (gaming, VoIP, kompetytywne FPS)
-    # Balanced     = kompromis - dobra przepustowosc i ping
-    [ValidateSet('Throughput','LowLatency','Balanced','Max')]
-    [string]$Mode = 'Max',
+    # === OPTIMIZATION MODE ===
+    # Throughput  = max bandwidth (downloads, streaming, file transfer)
+    # LowLatency  = min ping (gaming, VoIP, competitive FPS)
+    # Balanced    = compromise (good ping AND throughput)
+    [ValidateSet('Throughput','LowLatency','Balanced')]
+    [string]$Mode = 'Throughput',
 
-    # Wylacza Microsoft telemetrie (DiagTrack, dmwappushservice) -> wyzsza realna przepustowosc
+    # Disable Microsoft telemetry (DiagTrack, dmwappushservice, Delivery Optimization)
+    # WARNING: opt-in only - some users want telemetry for diagnostics
     [switch]$DisableTelemetry,
 
-    # DNS provider:
-    #   $null / 0  = interaktywne menu wyboru (default)
-    #   1-21       = wybor konkretnego dostawcy DNS
-    #   'Skip'     = nie zmieniaj DNS
-    #   IP1,IP2    = lista wlasnych adresow DNS
+    # DNS provider selector:
+    #   (not provided) = interactive menu (default)
+    #   1-21           = select provider by ID
+    #   99             = reset DNS to DHCP (router)
+    #   'Skip'         = don't change DNS
+    #   '1.1.1.1,9.9.9.9' = comma-separated custom IPs
     $DnsProvider,
 
-    # Pomija registry tweaks (tylko ustawienia karty + netsh)
+    # Skip registry tweaks (apply only adapter settings + netsh global)
     [switch]$NoRegistry,
 
-    # Pomija test MTU (oszczedza ~30 sekund)
+    # Skip MTU auto-detection (saves ~30 seconds, ICMP-based test)
     [switch]$NoMtuTest,
 
-    # Tryb cichy - bez promptow, exit po zakonczeniu (CI/automation)
+    # Silent mode - no prompts, auto-select all Ethernet, exit when done
+    # Recommended for CI/CD pipelines and unattended deployments
     [switch]$Silent
 )
 
 $ErrorActionPreference = 'Continue'
 $BackupDir = Join-Path $env:USERPROFILE 'Desktop\NIC-Backup'
 
-# Mode 'Max' = Throughput + agresywne tweaks (registry + telemetry off)
-if ($Mode -eq 'Max') {
-    $Mode = 'Throughput'
-    if (-not $PSBoundParameters.ContainsKey('DisableTelemetry')) {
-        $DisableTelemetry = $false  # NIE wymuszamy wylaczenia telemetrii bez zgody
+# ============================================================
+#   COLORFUL OUTPUT HELPERS
+#   Each message type has a unique colored prefix tag
+#   for instant visual scanning of logs.
+# ============================================================
+
+# Section header - cyan box that visually separates phases
+function Write-Section {
+    param([string]$title)
+    $width = 64
+    $border = '+' + ('=' * ($width - 2)) + '+'
+    $padded = '  ' + $title
+    if ($padded.Length -lt ($width - 2)) {
+        $padded = $padded.PadRight($width - 2)
     }
+    Write-Host ''
+    Write-Host $border -ForegroundColor DarkCyan
+    Write-Host ('|' + $padded + '|') -ForegroundColor Cyan
+    Write-Host $border -ForegroundColor DarkCyan
 }
 
-# ============================================================
-#   HELPERS
-# ============================================================
-function Write-Section($title) {
+# Sub-header inside a section (smaller, single-line)
+function Write-SubSection {
+    param([string]$title)
     Write-Host ''
-    Write-Host ('=' * 64) -ForegroundColor Cyan
-    Write-Host "  $title" -ForegroundColor Cyan
-    Write-Host ('=' * 64) -ForegroundColor Cyan
+    Write-Host "  --- $title ---" -ForegroundColor DarkCyan
 }
-function Write-OK   ($m) { Write-Host "  [OK]   $m" -ForegroundColor Green }
-function Write-Warn ($m) { Write-Host "  [WARN] $m" -ForegroundColor Yellow }
-function Write-Err  ($m) { Write-Host "  [ERR]  $m" -ForegroundColor Red }
-function Write-Info ($m) { Write-Host "  [..]   $m" -ForegroundColor Gray }
+
+# [ OK ]  green - operation succeeded
+function Write-OK {
+    param([string]$m)
+    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
+    Write-Host 'OK ' -NoNewline -ForegroundColor Green
+    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $m -ForegroundColor White
+}
+
+# [APLY]  cyan - applying a change (before/after value)
+function Write-Apply {
+    param([string]$m)
+    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '+> ' -NoNewline -ForegroundColor Cyan
+    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $m -ForegroundColor Cyan
+}
+
+# [WARN]  yellow - operation failed but non-critical
+function Write-Warn {
+    param([string]$m)
+    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '!! ' -NoNewline -ForegroundColor Yellow
+    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $m -ForegroundColor Yellow
+}
+
+# [ERR ]  red - operation failed critically
+function Write-Err {
+    param([string]$m)
+    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
+    Write-Host 'XX ' -NoNewline -ForegroundColor Red
+    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $m -ForegroundColor Red
+}
+
+# [INFO]  gray - informational, neither success nor failure
+function Write-Info {
+    param([string]$m)
+    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '.. ' -NoNewline -ForegroundColor DarkGray
+    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $m -ForegroundColor Gray
+}
+
+# [SKIP]  dark gray - skipped (already optimal or unsupported)
+function Write-Skip {
+    param([string]$m)
+    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '-- ' -NoNewline -ForegroundColor DarkGray
+    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $m -ForegroundColor DarkGray
+}
+
+# [TIP ]  magenta - hint or tip for the user
+function Write-Tip {
+    param([string]$m)
+    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '?? ' -NoNewline -ForegroundColor Magenta
+    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $m -ForegroundColor Magenta
+}
 
 # ============================================================
 #   WINDOWS COMPATIBILITY DETECTION
@@ -162,13 +239,13 @@ function Get-WindowsInfo {
     }
 
     return [PSCustomObject]@{
-        Name           = $name
-        Version        = $os.Version
-        BuildNumber    = $build
-        PSVersion      = $PSVersionTable.PSVersion.ToString()
-        SupportsNetAdapter   = ($build -ge 9600)   # Win 8.1+
-        SupportsPwshDns      = ($build -ge 9600)   # Set-DnsClientServerAddress requires Win 8.1+
-        Is64Bit              = [System.Environment]::Is64BitOperatingSystem
+        Name               = $name
+        Version            = $os.Version
+        BuildNumber        = $build
+        PSVersion          = $PSVersionTable.PSVersion.ToString()
+        SupportsNetAdapter = ($build -ge 9600)   # Win 8.1+ required for Get-NetAdapter
+        SupportsPwshDns    = ($build -ge 9600)   # Set-DnsClientServerAddress requires Win 8.1+
+        Architecture       = if ([System.Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
     }
 }
 
@@ -181,74 +258,95 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] `
             [Security.Principal.WindowsIdentity]::GetCurrent()
           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Err 'Skrypt wymaga uprawnien Administratora!'
-    Write-Info 'Uruchom przez Run-NIC-Optimizer.bat lub PowerShell jako Administrator'
-    if (-not $Silent) { Read-Host 'Nacisnij Enter aby zamknac' }
+    Write-Err 'This script requires Administrator privileges!'
+    Write-Info 'Run via Run-NIC-Optimizer.bat (auto-elevates) or open PowerShell as Administrator'
+    if (-not $Silent) { Read-Host 'Press Enter to exit' }
     exit 1
 }
 
-# Warn if older Windows
+# Warn if older Windows (pre Win 8.1) - some cmdlets unavailable
 if ($Global:WinInfo.BuildNumber -lt 9600) {
-    Write-Warn "Wykryto starszy Windows: $($Global:WinInfo.Name)"
-    Write-Warn 'Niektore funkcje moga byc niedostepne (Get-NetAdapter wymaga Win 8.1+)'
-    Write-Info 'Skrypt sprobuje uzyc fallbackow netsh/WMI gdzie to mozliwe'
+    Write-Warn "Older Windows detected: $($Global:WinInfo.Name)"
+    Write-Warn 'Some features may be unavailable (Get-NetAdapter requires Win 8.1+)'
+    Write-Info 'Script will use netsh/WMI fallbacks where possible'
     if (-not $Silent) {
-        $cont = Read-Host 'Kontynuowac mimo to? (T/N)'
-        if ($cont -notmatch '^[TtYy]') { exit 0 }
+        $cont = Read-Host 'Continue anyway? (Y/N)'
+        if ($cont -notmatch '^[YyTt]') { exit 0 }
     }
 }
 
 # ============================================================
 #   DNS PROVIDERS DATABASE
-#   Zrodla: DNSPerf 2025, Reddit r/dns, Cloudflare/Google/Quad9 docs,
-#           AdGuard, NextDNS, ControlD, DNS4EU, Mullvad, AliDNS
+#
+#   Each provider has:
+#     Id    - numeric selector (1-21, 99 for reset)
+#     Cat   - category for grouping in menu
+#     Name  - display name
+#     V4/V6 - IPv4/IPv6 server addresses
+#     Desc  - what this DNS does + privacy/filter info
+#
+#   Sources: DNSPerf 2025, Reddit r/dns, Cloudflare/Google/Quad9
+#            official docs, AdGuard, ControlD, DNS4EU, Mullvad,
+#            Chinese tech blogs (CSDN) for AliDNS/DNSPod info.
 # ============================================================
 $Global:DnsProviders = @(
-    # === SPEED / NEUTRAL (no filtering) ===
-    [PSCustomObject]@{ Id=1;  Cat='Speed';    Name='Cloudflare';            V4=@('1.1.1.1','1.0.0.1');                 V6=@('2606:4700:4700::1111','2606:4700:4700::1001'); Desc='Najszybszy globalnie wg DNSPerf, no log, no filter' }
-    [PSCustomObject]@{ Id=2;  Cat='Speed';    Name='Google Public DNS';     V4=@('8.8.8.8','8.8.4.4');                 V6=@('2001:4860:4860::8888','2001:4860:4860::8844'); Desc='Google, stabilny i szybki, ECS support' }
-    [PSCustomObject]@{ Id=3;  Cat='Speed';    Name='Quad9 Unsecured';       V4=@('9.9.9.10','149.112.112.10');         V6=@('2620:fe::10','2620:fe::fe:10');                Desc='Quad9 bez filtra bezpieczenstwa' }
-    [PSCustomObject]@{ Id=4;  Cat='Speed';    Name='OpenDNS Home';          V4=@('208.67.222.222','208.67.220.220');   V6=@('2620:119:35::35','2620:119:53::53');           Desc='Cisco OpenDNS, basic phishing block' }
+    # === SPEED / NEUTRAL (no filtering, fastest) ===
+    [PSCustomObject]@{ Id=1;  Cat='Speed';    Name='Cloudflare';            V4=@('1.1.1.1','1.0.0.1');                 V6=@('2606:4700:4700::1111','2606:4700:4700::1001'); Desc='Fastest globally per DNSPerf. No logs, no filter, supports DoH/DoT.' }
+    [PSCustomObject]@{ Id=2;  Cat='Speed';    Name='Google Public DNS';     V4=@('8.8.8.8','8.8.4.4');                 V6=@('2001:4860:4860::8888','2001:4860:4860::8844'); Desc='Google. Stable and fast, ECS support, large global anycast.' }
+    [PSCustomObject]@{ Id=3;  Cat='Speed';    Name='Quad9 Unsecured';       V4=@('9.9.9.10','149.112.112.10');         V6=@('2620:fe::10','2620:fe::fe:10');                Desc='Quad9 WITHOUT security filter. For users wanting raw speed.' }
+    [PSCustomObject]@{ Id=4;  Cat='Speed';    Name='OpenDNS Home';          V4=@('208.67.222.222','208.67.220.220');   V6=@('2620:119:35::35','2620:119:53::53');           Desc='Cisco OpenDNS. Basic phishing protection, decent speed.' }
 
     # === SECURITY (malware + phishing block) ===
-    [PSCustomObject]@{ Id=5;  Cat='Security'; Name='Cloudflare Malware';    V4=@('1.1.1.2','1.0.0.2');                 V6=@('2606:4700:4700::1112','2606:4700:4700::1002'); Desc='Cloudflare + blokada malware' }
-    [PSCustomObject]@{ Id=6;  Cat='Security'; Name='Quad9 Secure (recommended)'; V4=@('9.9.9.9','149.112.112.112');    V6=@('2620:fe::fe','2620:fe::9');                    Desc='Szwajcaria, blokada malware/phishing, no log, DNSSEC' }
-    [PSCustomObject]@{ Id=7;  Cat='Security'; Name='CleanBrowsing Security'; V4=@('185.228.168.9','185.228.169.9');    V6=@('2a0d:2a00:1::2','2a0d:2a00:2::2');             Desc='Security filter, blokada malware' }
+    [PSCustomObject]@{ Id=5;  Cat='Security'; Name='Cloudflare Malware';    V4=@('1.1.1.2','1.0.0.2');                 V6=@('2606:4700:4700::1112','2606:4700:4700::1002'); Desc='Cloudflare with malware blocklist. No filter for legit content.' }
+    [PSCustomObject]@{ Id=6;  Cat='Security'; Name='Quad9 Secure (RECOMMENDED)'; V4=@('9.9.9.9','149.112.112.112');    V6=@('2620:fe::fe','2620:fe::9');                    Desc='Switzerland-based. Blocks malware/phishing, no logs, DNSSEC. Best balance.' }
+    [PSCustomObject]@{ Id=7;  Cat='Security'; Name='CleanBrowsing Security'; V4=@('185.228.168.9','185.228.169.9');    V6=@('2a0d:2a00:1::2','2a0d:2a00:2::2');             Desc='Security filter blocking malware and phishing domains.' }
 
-    # === FAMILY (adult content block) ===
-    [PSCustomObject]@{ Id=8;  Cat='Family';   Name='Cloudflare Family';     V4=@('1.1.1.3','1.0.0.3');                 V6=@('2606:4700:4700::1113','2606:4700:4700::1003'); Desc='Cloudflare + malware + adult content block' }
-    [PSCustomObject]@{ Id=9;  Cat='Family';   Name='OpenDNS FamilyShield';  V4=@('208.67.222.123','208.67.220.123');   V6=@();                                              Desc='OpenDNS + adult content auto-block' }
-    [PSCustomObject]@{ Id=10; Cat='Family';   Name='CleanBrowsing Family';  V4=@('185.228.168.168','185.228.169.168'); V6=@('2a0d:2a00:1::','2a0d:2a00:2::');               Desc='Family + adult + malware filter' }
+    # === FAMILY (adult content block, kid-safe) ===
+    [PSCustomObject]@{ Id=8;  Cat='Family';   Name='Cloudflare Family';     V4=@('1.1.1.3','1.0.0.3');                 V6=@('2606:4700:4700::1113','2606:4700:4700::1003'); Desc='Cloudflare + malware + adult content (NSFW) blocking.' }
+    [PSCustomObject]@{ Id=9;  Cat='Family';   Name='OpenDNS FamilyShield';  V4=@('208.67.222.123','208.67.220.123');   V6=@();                                              Desc='OpenDNS with auto-block of adult content. Good for kids networks.' }
+    [PSCustomObject]@{ Id=10; Cat='Family';   Name='CleanBrowsing Family';  V4=@('185.228.168.168','185.228.169.168'); V6=@('2a0d:2a00:1::','2a0d:2a00:2::');               Desc='Family-friendly: blocks adult, malware, mixed content.' }
 
-    # === ADBLOCK (blocks ads + trackers) ===
-    [PSCustomObject]@{ Id=11; Cat='AdBlock';  Name='AdGuard DNS (default)'; V4=@('94.140.14.14','94.140.15.15');       V6=@('2a10:50c0::ad1:ff','2a10:50c0::ad2:ff');       Desc='Blokada reklam + trackerow (popularny)' }
-    [PSCustomObject]@{ Id=12; Cat='AdBlock';  Name='AdGuard Family';        V4=@('94.140.14.15','94.140.15.16');       V6=@('2a10:50c0::bad1:ff','2a10:50c0::bad2:ff');     Desc='AdGuard + adult content block' }
-    [PSCustomObject]@{ Id=13; Cat='AdBlock';  Name='ControlD Free (ads)';   V4=@('76.76.2.0','76.76.10.0');            V6=@('2606:1a40::','2606:1a40:1::');                 Desc='ControlD - blokuje reklamy, customizable' }
-    [PSCustomObject]@{ Id=14; Cat='AdBlock';  Name='Mullvad AdBlock';       V4=@('194.242.2.3','194.242.2.4');         V6=@('2a07:e340::3','2a07:e340::4');                 Desc='Mullvad VPN - prywatnosc + adblock' }
+    # === ADBLOCK (blocks ads + trackers system-wide) ===
+    [PSCustomObject]@{ Id=11; Cat='AdBlock';  Name='AdGuard DNS (default)'; V4=@('94.140.14.14','94.140.15.15');       V6=@('2a10:50c0::ad1:ff','2a10:50c0::ad2:ff');       Desc='Most popular adblock DNS. Blocks ads + trackers in apps/games too.' }
+    [PSCustomObject]@{ Id=12; Cat='AdBlock';  Name='AdGuard Family';        V4=@('94.140.14.15','94.140.15.16');       V6=@('2a10:50c0::bad1:ff','2a10:50c0::bad2:ff');     Desc='AdGuard + adult content block. Best for kid-safe + ad-free internet.' }
+    [PSCustomObject]@{ Id=13; Cat='AdBlock';  Name='ControlD Free (ads)';   V4=@('76.76.2.0','76.76.10.0');            V6=@('2606:1a40::','2606:1a40:1::');                 Desc='ControlD with ad blocking. Free tier, paid for customization.' }
+    [PSCustomObject]@{ Id=14; Cat='AdBlock';  Name='Mullvad AdBlock';       V4=@('194.242.2.3','194.242.2.4');         V6=@('2a07:e340::3','2a07:e340::4');                 Desc='Mullvad VPN provider. Privacy-first + ads blocked.' }
 
-    # === PRIVACY (no logs, encrypted) ===
-    [PSCustomObject]@{ Id=15; Cat='Privacy';  Name='AdGuard Unfiltered';    V4=@('94.140.14.140','94.140.14.141');     V6=@('2a10:50c0::1:ff','2a10:50c0::2:ff');           Desc='AdGuard bez filtra, no log' }
-    [PSCustomObject]@{ Id=16; Cat='Privacy';  Name='Mullvad DNS';           V4=@('194.242.2.2','194.242.2.3');         V6=@('2a07:e340::2','2a07:e340::3');                 Desc='Szwecja, max prywatnosc, no log' }
+    # === PRIVACY (no logs, encryption-focused) ===
+    [PSCustomObject]@{ Id=15; Cat='Privacy';  Name='AdGuard Unfiltered';    V4=@('94.140.14.140','94.140.14.141');     V6=@('2a10:50c0::1:ff','2a10:50c0::2:ff');           Desc='AdGuard infrastructure WITHOUT filtering. No logs.' }
+    [PSCustomObject]@{ Id=16; Cat='Privacy';  Name='Mullvad DNS';           V4=@('194.242.2.2','194.242.2.3');         V6=@('2a07:e340::2','2a07:e340::3');                 Desc='Sweden. Max privacy, no logs, no filtering, RAM-only.' }
 
-    # === EU (European Union, GDPR) ===
-    [PSCustomObject]@{ Id=17; Cat='EU';       Name='DNS4EU Protective';     V4=@('86.54.11.1','86.54.11.201');         V6=@('2a13:1001::86:54:11:1','2a13:1001::86:54:11:201'); Desc='EU-finansowany, GDPR, blokada malware' }
-    [PSCustomObject]@{ Id=18; Cat='EU';       Name='DNS4EU Unfiltered';     V4=@('86.54.11.100','86.54.11.200');       V6=@('2a13:1001::86:54:11:100','2a13:1001::86:54:11:200'); Desc='DNS4EU bez filtra' }
-    [PSCustomObject]@{ Id=19; Cat='EU';       Name='DNS4EU Child Protect';  V4=@('86.54.11.13','86.54.11.213');        V6=@();                                              Desc='DNS4EU + ochrona dzieci' }
+    # === EU (European Union, GDPR-compliant) ===
+    [PSCustomObject]@{ Id=17; Cat='EU';       Name='DNS4EU Protective';     V4=@('86.54.11.1','86.54.11.201');         V6=@('2a13:1001::86:54:11:1','2a13:1001::86:54:11:201'); Desc='EU-funded resolver (2025). GDPR, blocks malware/phishing.' }
+    [PSCustomObject]@{ Id=18; Cat='EU';       Name='DNS4EU Unfiltered';     V4=@('86.54.11.100','86.54.11.200');       V6=@('2a13:1001::86:54:11:100','2a13:1001::86:54:11:200'); Desc='DNS4EU without any filter. Pure EU-hosted resolver.' }
+    [PSCustomObject]@{ Id=19; Cat='EU';       Name='DNS4EU Child Protect';  V4=@('86.54.11.13','86.54.11.213');        V6=@();                                              Desc='DNS4EU + child protection (adult content + malware filter).' }
 
-    # === CHINA (for users in mainland China) ===
-    [PSCustomObject]@{ Id=20; Cat='China';    Name='AliDNS (Alibaba)';      V4=@('223.5.5.5','223.6.6.6');             V6=@('2400:3200::1','2400:3200:baba::1');            Desc='Alibaba, najszybszy w Chinach (zhongguo)' }
-    [PSCustomObject]@{ Id=21; Cat='China';    Name='DNSPod (Tencent)';      V4=@('119.29.29.29','182.254.116.116');    V6=@();                                              Desc='Tencent, stabilny w Chinach' }
+    # === CHINA (for users in mainland China, lower latency to CN servers) ===
+    [PSCustomObject]@{ Id=20; Cat='China';    Name='AliDNS (Alibaba)';      V4=@('223.5.5.5','223.6.6.6');             V6=@('2400:3200::1','2400:3200:baba::1');            Desc='Alibaba Cloud DNS. Fastest in mainland China. Limits since Sept 2024.' }
+    [PSCustomObject]@{ Id=21; Cat='China';    Name='DNSPod (Tencent)';      V4=@('119.29.29.29','182.254.116.116');    V6=@();                                              Desc='Tencent DNS. Stable in China, supports SM2 (Chinese crypto).' }
 
     # === RESET / SKIP ===
-    [PSCustomObject]@{ Id=99; Cat='Reset';    Name='Reset to DHCP (router)'; V4=@();                                   V6=@();                                              Desc='Wroc do DNS od routera (DHCP, np. AdBlock OpenWrt)' }
+    [PSCustomObject]@{ Id=99; Cat='Reset';    Name='Reset to DHCP (router)'; V4=@();                                   V6=@();                                              Desc='Reset DNS to DHCP-assigned (use this if router runs Pi-hole/AdGuard Home).' }
 )
 
 # ============================================================
 #   DNS INTERACTIVE MENU
+#   Displays providers grouped by category with colors and descriptions.
+#   Returns user's choice as a string.
 # ============================================================
 function Show-DnsMenu {
-    Write-Section 'WYBOR DNS - DOSTAWCY POSORTOWANI WG KATEGORII'
+    Write-Section 'DNS PROVIDER SELECTION  -  21 OPTIONS, GROUPED BY CATEGORY'
     Write-Host ''
+    Write-Host '  Pick a DNS based on what you want:' -ForegroundColor White
+    Write-Host '    * Maximum speed             -> Speed (1-4)' -ForegroundColor Gray
+    Write-Host '    * Block malware/phishing    -> Security (5-7)' -ForegroundColor Gray
+    Write-Host '    * Block ads system-wide     -> AdBlock (11-14)' -ForegroundColor Gray
+    Write-Host '    * Kid-safe internet         -> Family (8-10)' -ForegroundColor Gray
+    Write-Host '    * Privacy / no logging      -> Privacy (15-16)' -ForegroundColor Gray
+    Write-Host '    * European Union (GDPR)     -> EU (17-19)' -ForegroundColor Gray
+    Write-Host '    * Mainland China users      -> China (20-21)' -ForegroundColor Gray
+    Write-Host ''
+
     $cats = $Global:DnsProviders | Group-Object Cat
     foreach ($cat in $cats) {
         $color = switch ($cat.Name) {
@@ -270,33 +368,41 @@ function Show-DnsMenu {
             'EU'       { '[EU  ]' }
             'China'    { '[CN  ]' }
             'Reset'    { '[----]' }
+            default    { '[????]' }
         }
         Write-Host ('  ' + $icon + '  ' + $cat.Name.ToUpper()) -ForegroundColor $color
         foreach ($p in $cat.Group) {
             $ips = ($p.V4 -join ', ')
-            Write-Host ('     [{0,2}] {1,-32} {2}' -f $p.Id, $p.Name, $ips) -ForegroundColor White
-            Write-Host ('          {0}' -f $p.Desc) -ForegroundColor DarkGray
+            if (-not $ips) { $ips = '(none - reset to DHCP)' }
+            Write-Host ('     [') -NoNewline -ForegroundColor DarkGray
+            Write-Host ('{0,2}' -f $p.Id) -NoNewline -ForegroundColor White
+            Write-Host (']  ') -NoNewline -ForegroundColor DarkGray
+            Write-Host ('{0,-34}' -f $p.Name) -NoNewline -ForegroundColor White
+            Write-Host $ips -ForegroundColor $color
+            Write-Host ('          ' + $p.Desc) -ForegroundColor DarkGray
         }
         Write-Host ''
     }
-    Write-Host '  [Skip]  Nie zmieniaj DNS (zostan przy DHCP/router)' -ForegroundColor DarkGray
-    Write-Host '  [c]     Custom - podaj wlasne adresy DNS (np. 1.1.1.1,9.9.9.9)' -ForegroundColor DarkGray
+    Write-Host '  [Skip]  Keep current DNS (do not change anything)' -ForegroundColor DarkGray
+    Write-Host '  [ c ]   Custom - enter your own DNS IPs (e.g. 1.1.1.1,9.9.9.9)' -ForegroundColor DarkGray
     Write-Host ''
-    return Read-Host 'Wybierz ID DNS (1-21, Skip, c)'
+    return Read-Host 'Enter DNS ID (1-21, 99=reset, Skip, c=custom)'
 }
 
 # ============================================================
-#   SET DNS (uniwersalny - dziala z dowolnym providerem z listy)
+#   SET DNS FOR ADAPTER
+#   Universal - works with any provider from $Global:DnsProviders
+#   Falls back to netsh on older Windows (pre 8.1).
 # ============================================================
 function Set-DnsForAdapter {
     param(
         [Parameter(Mandatory)] [string]$AdapterName,
-        [Parameter(Mandatory)] $Provider  # PSCustomObject z $Global:DnsProviders
+        [Parameter(Mandatory)] $Provider  # PSCustomObject from $Global:DnsProviders
     )
 
-    Write-Section "DNS: $($Provider.Name) -> $AdapterName"
+    Write-Section "DNS APPLY:  $($Provider.Name)  ->  $AdapterName"
 
-    # Specjalna obsluga: Reset / Skip
+    # Special case: Reset (Id=99) -> revert to DHCP-assigned DNS (router)
     if ($Provider.Id -eq 99 -or $Provider.Cat -eq 'Reset') {
         try {
             if ($Global:WinInfo.SupportsPwshDns) {
@@ -305,20 +411,20 @@ function Set-DnsForAdapter {
                 netsh interface ip set dns name="$AdapterName" source=dhcp | Out-Null
                 netsh interface ipv6 set dns name="$AdapterName" source=dhcp | Out-Null
             }
-            Write-OK "DNS zresetowany do DHCP (router)"
+            Write-OK 'DNS reset to DHCP (will use router-assigned DNS)'
             return
         } catch {
-            Write-Warn "Reset DNS: $($_.Exception.Message)"
+            Write-Warn "DNS reset failed: $($_.Exception.Message)"
             return
         }
     }
 
-    # Zbierz wszystkie IP (v4 + v6)
+    # Collect all IP addresses (IPv4 + IPv6)
     $addresses = @()
     if ($Provider.V4) { $addresses += $Provider.V4 }
     if ($Provider.V6) { $addresses += $Provider.V6 }
     if (-not $addresses) {
-        Write-Warn 'Brak adresow DNS dla tego providera'
+        Write-Warn 'No DNS addresses found for this provider'
         return
     }
 
@@ -337,50 +443,51 @@ function Set-DnsForAdapter {
                 netsh interface ipv6 add dns name="$AdapterName" addr=$v6 | Out-Null
             }
         }
-        Write-OK "DNS ustawiony:"
-        foreach ($addr in $addresses) { Write-Host "         $addr" -ForegroundColor Gray }
+        Write-OK 'DNS servers configured:'
+        foreach ($addr in $addresses) { Write-Host "          $addr" -ForegroundColor Cyan }
 
-        # Wyczysc cache DNS
+        # Flush DNS cache so new servers take effect immediately
         try {
             if (Get-Command Clear-DnsClientCache -ErrorAction SilentlyContinue) {
                 Clear-DnsClientCache -ErrorAction SilentlyContinue
             } else {
                 ipconfig /flushdns | Out-Null
             }
-            Write-OK 'DNS cache wyczyszczony'
+            Write-OK 'DNS cache flushed (new DNS will be used immediately)'
         } catch { }
     } catch {
-        Write-Warn "DNS: $($_.Exception.Message)"
+        Write-Warn "DNS configuration failed: $($_.Exception.Message)"
     }
 }
 
 # ============================================================
-#   PARSE DnsProvider parameter (input from -DnsProvider)
+#   PARSE DnsProvider PARAMETER
+#   Resolves user input (number / 'Skip' / IP list) into a provider object.
 # ============================================================
 function Resolve-DnsProvider {
     param($InputValue)
 
-    # Skip
+    # Skip - keep current DNS
     if ($null -eq $InputValue -or $InputValue -eq '' -or $InputValue -eq 'Skip' -or $InputValue -eq 'skip') {
         return $null
     }
 
-    # Numeric ID
+    # Numeric ID -> lookup in providers list
     if ($InputValue -match '^\d+$') {
         $id = [int]$InputValue
         $provider = $Global:DnsProviders | Where-Object { $_.Id -eq $id }
         if ($provider) { return $provider }
-        Write-Warn "Nieznany ID DNS: $id"
+        Write-Warn "Unknown DNS provider ID: $id  (valid: 1-21, 99)"
         return $null
     }
 
-    # Custom IP list (np. "1.1.1.1,9.9.9.9")
+    # Custom IP list (e.g. '1.1.1.1,9.9.9.9' or '1.1.1.1;2606:4700::1111')
     if ($InputValue -match '^[\d\.,:a-fA-F\s]+$') {
         $ips = $InputValue -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
         $v4 = $ips | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }
         $v6 = $ips | Where-Object { $_ -match ':' }
         return [PSCustomObject]@{
-            Id=999; Cat='Custom'; Name='Custom DNS'; V4=$v4; V6=$v6; Desc='Wlasne adresy uzytkownika'
+            Id=999; Cat='Custom'; Name='Custom DNS'; V4=$v4; V6=$v6; Desc='User-provided DNS addresses'
         }
     }
 
@@ -388,30 +495,42 @@ function Resolve-DnsProvider {
 }
 
 # ============================================================
-#   OPTIMAL SETTINGS - dynamicznie budowane wg Mode
-#   Klucze to regex DisplayName, wartości to docelowy DisplayValue
-#   Skrypt sam wykryje co karta wspiera (pomija nieobsługiwane).
+#   OPTIMAL ADAPTER SETTINGS
+#
+#   Built dynamically based on Mode (Throughput/LowLatency/Balanced).
+#   Keys are regex patterns matched against DisplayName of each
+#   advanced property. Multiple language variants are included
+#   (English + Polish names) for cross-locale compatibility.
+#
+#   The script auto-detects which settings the adapter supports
+#   and skips unsupported ones (so it works on any NIC vendor).
 # ============================================================
 function Get-OptimalSettings {
     param([string]$ModeName)
 
     $base = @(
-        # === LINK NEGOTIATION (kluczowe dla problemu 100Mbps!) ===
+        # === LINK NEGOTIATION ===
+        # Critical: forces 1Gbps full-duplex auto-negotiation.
+        # Common cause of stuck-at-100Mbps issues.
         @{ Pattern = '^Speed.+Duplex$|^Szybkosc.+Dupleks$|^Speed/Duplex$';  Value = 'Auto Negotiation' }
         @{ Pattern = '^Auto Negotiation$';                                  Value = 'Enabled' }
         @{ Pattern = 'Wait for Link';                                       Value = 'On' }
 
-        # === FLOW CONTROL & RSS ===
+        # === FLOW CONTROL & RSS (Receive Side Scaling) ===
+        # Flow Control: pause frames prevent buffer overflow.
+        # RSS: distributes incoming packets across multiple CPU cores.
         @{ Pattern = '^Flow Control$|Sterowanie przeplywem';                Value = 'Rx & Tx Enabled' }
         @{ Pattern = 'Receive Side Scaling$|^RSS$';                         Value = 'Enabled' }
         @{ Pattern = 'Maximum Number of RSS Queues|RSS Queues';             Value = '4 Queues' }
         @{ Pattern = 'NetworkDirect|RDMA';                                  Value = 'Enabled' }
 
-        # === BUFORY (max przepustowosc) ===
+        # === BUFFERS (max throughput) ===
+        # Bigger buffers = less packet drop under load (downloads, streaming).
         @{ Pattern = 'Receive Buffers|Bufory odbioru';                      Value = '2048' }
         @{ Pattern = 'Transmit Buffers|Bufory wysylania|Send Buffers';      Value = '2048' }
 
-        # === OFFLOAD CHECKSUMOW (CPU offload do karty) ===
+        # === CHECKSUM OFFLOADS (CPU -> NIC) ===
+        # Hardware computes checksums instead of CPU. Less CPU usage.
         @{ Pattern = 'TCP Checksum Offload \(IPv4\)';                       Value = 'Rx & Tx Enabled' }
         @{ Pattern = 'TCP Checksum Offload \(IPv6\)';                       Value = 'Rx & Tx Enabled' }
         @{ Pattern = 'UDP Checksum Offload \(IPv4\)';                       Value = 'Rx & Tx Enabled' }
@@ -420,11 +539,15 @@ function Get-OptimalSettings {
         @{ Pattern = 'ARP Offload';                                         Value = 'Enabled' }
         @{ Pattern = 'NS Offload';                                          Value = 'Enabled' }
 
-        # === JUMBO (router PPPoE 1492 nie wspiera 9k - WYLACZAMY) ===
+        # === JUMBO FRAMES ===
+        # Disabled by default - most home routers/ISPs use 1500 MTU.
+        # Enable only if your entire network supports 9000 MTU end-to-end.
         @{ Pattern = 'Jumbo (Packet|Frame)';                                Value = 'Disabled' }
         @{ Pattern = 'Packet Priority.+VLAN|Priority.+VLAN';                Value = 'Packet Priority & VLAN Enabled' }
 
-        # === WYLACZ OSZCZEDZANIE ENERGII (glowna przyczyna problemu 100Mbps!) ===
+        # === DISABLE POWER SAVING (main cause of speed drops!) ===
+        # EEE/Green Ethernet downgrades link to save power -> bandwidth drops.
+        # Disabling these is critical for stable gigabit speed.
         @{ Pattern = 'Energy.Efficient Ethernet|^EEE$';                     Value = 'Disabled' }
         @{ Pattern = 'Advanced EEE';                                        Value = 'Disabled' }
         @{ Pattern = 'Green Ethernet';                                      Value = 'Disabled' }
@@ -438,9 +561,11 @@ function Get-OptimalSettings {
         @{ Pattern = 'Power Down PHY|Shutdown Wake.On.Lan';                 Value = 'Disabled' }
     )
 
-    # === ROZNICE TRYBOW ===
+    # === MODE-SPECIFIC SETTINGS ===
     if ($ModeName -eq 'Throughput') {
-        # Max przepustowosc - wszystkie offloady wlaczone, interrupt moderation ON
+        # Max bandwidth: all offloads ON, adaptive interrupt moderation.
+        # LSO = Large Send Offload (CPU sends large segment, NIC chunks it)
+        # RSC = Receive Segment Coalescing (NIC merges packets before CPU)
         $base += @(
             @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Enabled' }
             @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Enabled' }
@@ -452,7 +577,8 @@ function Get-OptimalSettings {
         )
     }
     elseif ($ModeName -eq 'LowLatency') {
-        # Gaming / VoIP - LSO/RSC OFF (zwieksza opoznienia), Interrupt Moderation OFF
+        # Gaming/VoIP: LSO/RSC OFF (they batch packets -> add latency).
+        # Interrupt Moderation OFF (process every packet immediately).
         $base += @(
             @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Disabled' }
             @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Disabled' }
@@ -465,7 +591,7 @@ function Get-OptimalSettings {
         )
     }
     else {
-        # Balanced - kompromis (Adaptive)
+        # Balanced: keep offloads but adaptive timing.
         $base += @(
             @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Enabled' }
             @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Enabled' }
@@ -482,10 +608,13 @@ function Get-OptimalSettings {
 $OptimalSettings = Get-OptimalSettings -ModeName $Mode
 
 # ============================================================
-#   FUNCTIONS
+#   ADAPTER MANAGEMENT FUNCTIONS
 # ============================================================
+
+# Lists all network adapters with status, link speed, MAC, description.
+# Used at start (before optimization) and end (to verify changes).
 function Show-Adapters {
-    Write-Section 'KARTY SIECIOWE W SYSTEMIE'
+    Write-Section 'NETWORK ADAPTERS DETECTED ON THIS SYSTEM'
     Get-NetAdapter | Sort-Object @{e='Status';desc=$true}, Name |
         Format-Table -AutoSize `
             @{N='Name';        E={$_.Name}},
@@ -495,7 +624,10 @@ function Show-Adapters {
             @{N='Description'; E={$_.InterfaceDescription}}
 }
 
-function Backup-AdapterSettings($adapterName) {
+# Saves current adapter advanced properties to JSON for later rollback.
+# Backup folder: $env:USERPROFILE\Desktop\NIC-Backup\
+function Backup-AdapterSettings {
+    param([string]$adapterName)
     if (-not (Test-Path $BackupDir)) {
         New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
     }
@@ -508,20 +640,23 @@ function Backup-AdapterSettings($adapterName) {
 
     if ($props) {
         $props | ConvertTo-Json -Depth 6 | Set-Content -Path $file -Encoding UTF8
-        Write-OK "Backup zapisany: $file"
+        Write-OK "Backup saved: $file"
     } else {
-        Write-Warn 'Brak ustawien zaawansowanych do backupu'
+        Write-Warn 'No advanced properties to backup (basic adapter)'
     }
     return $file
 }
 
-function Optimize-Adapter($adapterName) {
-    Write-Section "OPTYMALIZACJA KARTY: $adapterName"
+# Main per-adapter optimization function.
+# Iterates over advanced properties and applies $OptimalSettings.
+function Optimize-Adapter {
+    param([string]$adapterName)
+    Write-Section "OPTIMIZING ADAPTER:  $adapterName"
     Backup-AdapterSettings $adapterName | Out-Null
 
     $props = Get-NetAdapterAdvancedProperty -Name $adapterName -ErrorAction SilentlyContinue
     if (-not $props) {
-        Write-Warn 'Karta nie udostepnia ustawien zaawansowanych'
+        Write-Warn 'This adapter does not expose advanced properties (skipped)'
         return
     }
 
@@ -531,7 +666,7 @@ function Optimize-Adapter($adapterName) {
         $displayName = $prop.DisplayName
         if ([string]::IsNullOrWhiteSpace($displayName)) { continue }
 
-        # Find a matching optimal setting
+        # Find a matching optimal setting from $OptimalSettings table
         $match = $OptimalSettings | Where-Object { $displayName -match $_.Pattern } | Select-Object -First 1
         if (-not $match) {
             $skipped++
@@ -540,15 +675,15 @@ function Optimize-Adapter($adapterName) {
 
         $newValue = $match.Value
         if ($prop.DisplayValue -eq $newValue) {
-            Write-Info "$displayName  =  $newValue  (juz OK)"
+            Write-Skip "$displayName  =  $newValue  (already optimal)"
             $alreadyOk++
             continue
         }
 
-        # Sprawdź czy karta wspiera tę wartość (jeśli ma listę dopuszczalnych)
+        # Check if adapter supports this exact value (some have a fixed list)
         if ($prop.ValidDisplayValues -and $prop.ValidDisplayValues.Count -gt 0) {
             if ($prop.ValidDisplayValues -notcontains $newValue) {
-                # Spróbuj znaleźć najbliższy odpowiednik
+                # Try to find an equivalent value (e.g. 'Off' instead of 'Disabled')
                 $alt = $prop.ValidDisplayValues | Where-Object { $_ -match 'Disabled|Off' -and $newValue -match 'Disabled' } | Select-Object -First 1
                 if (-not $alt) {
                     $alt = $prop.ValidDisplayValues | Where-Object { $_ -match 'Enabled|On' -and $newValue -match 'Enabled' } | Select-Object -First 1
@@ -556,7 +691,7 @@ function Optimize-Adapter($adapterName) {
                 if ($alt) {
                     $newValue = $alt
                 } else {
-                    Write-Warn "$displayName : '$($match.Value)' nieobslugiwane (mozliwe: $($prop.ValidDisplayValues -join ', '))"
+                    Write-Warn "$displayName : '$($match.Value)' not supported (allowed: $($prop.ValidDisplayValues -join ', '))"
                     $failed++
                     continue
                 }
@@ -565,32 +700,39 @@ function Optimize-Adapter($adapterName) {
 
         try {
             Set-NetAdapterAdvancedProperty -Name $adapterName -DisplayName $displayName -DisplayValue $newValue -NoRestart -ErrorAction Stop
-            Write-OK "$displayName : $($prop.DisplayValue)  ->  $newValue"
+            Write-Apply "$displayName : $($prop.DisplayValue)  ->  $newValue"
             $applied++
         } catch {
-            Write-Warn "$displayName  ->  $newValue  (blad: $($_.Exception.Message.Split([Environment]::NewLine)[0]))"
+            Write-Warn "$displayName  ->  $newValue  (error: $($_.Exception.Message.Split([Environment]::NewLine)[0]))"
             $failed++
         }
     }
 
     Write-Host ''
-    Write-Info "Zastosowano: $applied  |  Juz OK: $alreadyOk  |  Pominieto: $skipped  |  Bledy: $failed"
+    Write-Host '  --- Adapter optimization summary ---' -ForegroundColor DarkCyan
+    Write-Host '    Applied:    ' -NoNewline; Write-Host $applied   -ForegroundColor Green
+    Write-Host '    Already OK: ' -NoNewline; Write-Host $alreadyOk -ForegroundColor White
+    Write-Host '    Skipped:    ' -NoNewline; Write-Host $skipped   -ForegroundColor DarkGray
+    Write-Host '    Failed:     ' -NoNewline; Write-Host $failed    -ForegroundColor Yellow
 
-    # Restart adapter once at end (so all changes apply together)
+    # Restart adapter once at end (so all changes apply together with one drop)
     if ($applied -gt 0) {
         try {
-            Write-Info 'Restartuje karte aby zastosowac zmiany...'
+            Write-Info 'Restarting adapter to apply changes...'
             Restart-NetAdapter -Name $adapterName -ErrorAction Stop
             Start-Sleep -Seconds 3
-            Write-OK 'Karta zrestartowana'
+            Write-OK 'Adapter restarted successfully'
         } catch {
-            Write-Warn "Restart karty nie powiodl sie: $($_.Exception.Message)"
+            Write-Warn "Adapter restart failed: $($_.Exception.Message)"
         }
     }
 }
 
-function Disable-PowerManagement($adapterName) {
-    Write-Section "WYLACZANIE POWER MANAGEMENT: $adapterName"
+# Disables Windows Device Manager 'Allow the computer to turn off this device'
+# This prevents Windows from putting the NIC to sleep -> stable bandwidth.
+function Disable-PowerManagement {
+    param([string]$adapterName)
+    Write-Section "POWER MANAGEMENT:  $adapterName"
     try {
         $adapter   = Get-NetAdapter -Name $adapterName -ErrorAction Stop
         $instance  = Get-CimInstance -Namespace 'root\wmi' -ClassName 'MSPower_DeviceEnable' -ErrorAction SilentlyContinue |
@@ -598,94 +740,104 @@ function Disable-PowerManagement($adapterName) {
         if ($instance) {
             $instance.Enable = $false
             Set-CimInstance -InputObject $instance -ErrorAction Stop
-            Write-OK 'Wylaczono "Pozwol komputerowi wylaczac to urzadzenie"'
+            Write-OK 'Disabled: "Allow computer to turn off this device to save power"'
         } else {
-            Write-Info 'Karta nie wspiera Windows power management API'
+            Write-Info 'Adapter does not support Windows power management API'
         }
 
-        # Also disable WakeOnMagicPacket / WakeOnPattern (not really power but related)
+        # Also disable Wake-on-LAN magic packets (not strictly power but related)
         $wake = Get-CimInstance -Namespace 'root\wmi' -ClassName 'MSPower_DeviceWakeEnable' -ErrorAction SilentlyContinue |
                 Where-Object { $_.InstanceName -like "*$($adapter.PnPDeviceID)*" }
         if ($wake) {
             $wake.Enable = $false
             Set-CimInstance -InputObject $wake -ErrorAction SilentlyContinue
-            Write-OK 'Wylaczono "Wake on magic packet" (oszczedzanie)'
+            Write-OK 'Disabled: "Allow this device to wake the computer" (Wake-on-LAN)'
         }
     } catch {
-        Write-Warn "Power mgmt: $($_.Exception.Message)"
+        Write-Warn "Power management failed: $($_.Exception.Message)"
     }
 }
 
+# Tunes Windows TCP/IP stack globally via netsh.
+# These changes affect ALL network adapters and require admin.
+# Recommended reboot after for full effect.
 function Optimize-TcpIpGlobal {
     param([string]$ModeName = 'Throughput')
-    Write-Section "OPTYMALIZACJA TCP/IP GLOBALNA  (tryb: $ModeName)"
+    Write-Section "GLOBAL TCP/IP TUNING  (mode: $ModeName)"
 
-    # === Auto-tuning level zalezny od trybu ===
-    # experimental    = max throughput (RFC 7323), wykorzystuje window scaling do max
-    # normal          = standard, dobry kompromis
-    # highlyrestricted= najnizszy ping ale ogranicza window scaling
+    # === Auto-tuning level (window scaling behavior) ===
+    # experimental    = max throughput (RFC 7323), aggressive window scaling
+    # normal          = standard, good balance
+    # highlyrestricted = lowest ping but small windows (slow on long-distance)
+    # disabled        = no scaling, only for legacy/buggy routers
     $autotuning = switch ($ModeName) {
-        'Throughput' { 'experimental' }   # max BDP - polski ISP wspiera
-        'LowLatency' { 'normal' }          # nie psuje windows scaling, ale konserwatywny
+        'Throughput' { 'experimental' }   # max BDP utilization
+        'LowLatency' { 'normal' }          # conservative, no scaling issues
         default      { 'normal' }
     }
 
-    # === Congestion provider ===
-    # cubic    = standard od Win10 1709, dobry dla wysokich przepustowosci (gigabit+)
-    # ctcp     = Compound TCP - lepszy dla srednich predkosci
-    # newreno  = stary, kompatybilny ale wolny
+    # === Congestion control algorithm ===
+    # cubic    = default since Win10 1709, best for gigabit+ connections (Linux uses it too)
+    # ctcp     = Compound TCP - more responsive at low latency, good for gaming
+    # newreno  = legacy, slow on modern networks
     $congestion = switch ($ModeName) {
         'Throughput' { 'cubic' }
-        'LowLatency' { 'ctcp' }    # bardziej responsywny przy niskich opoznieniach
+        'LowLatency' { 'ctcp' }     # more responsive under low RTT conditions
         default      { 'cubic' }
     }
 
     $cmds = @(
         # === AUTO-TUNING & HEURISTICS ===
-        @{c="netsh int tcp set global autotuninglevel=$autotuning";           desc="TCP Auto-tuning: $autotuning"}
-        @{c='netsh int tcp set heuristics disabled';                          desc='TCP Heuristics: OFF (wymusza autotuninglevel)'}
-        @{c='netsh int tcp set global rss=enabled';                           desc='Receive Side Scaling: ON'}
-        @{c='netsh int tcp set global rsc=enabled';                           desc='Receive Segment Coalescing: ON'}
-        @{c='netsh int tcp set global chimney=automatic';                     desc='TCP Chimney Offload: auto'}
-        @{c='netsh int tcp set global dca=enabled';                           desc='Direct Cache Access: ON (CPU cache)'}
-        @{c='netsh int tcp set global netdma=enabled';                        desc='NetDMA: ON'}
+        # Auto-tuning controls TCP receive window size dynamically.
+        # Heuristics OFF forces our autotuning level (Win sometimes auto-changes it).
+        @{c="netsh int tcp set global autotuninglevel=$autotuning";           desc="TCP Auto-tuning: $autotuning  [controls receive window size scaling]"}
+        @{c='netsh int tcp set heuristics disabled';                          desc='TCP Heuristics: OFF  [prevents Windows from changing autotuning]'}
+        @{c='netsh int tcp set global rss=enabled';                           desc='Receive Side Scaling: ON  [distributes packets across CPU cores]'}
+        @{c='netsh int tcp set global rsc=enabled';                           desc='Receive Segment Coalescing: ON  [merges packets - higher throughput]'}
+        @{c='netsh int tcp set global chimney=automatic';                     desc='TCP Chimney Offload: auto  [offloads TCP processing to NIC]'}
+        @{c='netsh int tcp set global dca=enabled';                           desc='Direct Cache Access: ON  [packets land directly in CPU cache]'}
+        @{c='netsh int tcp set global netdma=enabled';                        desc='NetDMA: ON  [reduces CPU load via DMA]'}
 
-        # === CONGESTION & ECN ===
-        @{c="netsh int tcp set supplemental internet congestionprovider=$congestion"; desc="Congestion provider: $congestion"}
-        @{c='netsh int tcp set global ecncapability=enabled';                 desc='ECN Capability: ON (lepsze przy zatorach)'}
-        @{c='netsh int tcp set global prr=enabled';                           desc='Proportional Rate Reduction: ON'}
-        @{c='netsh int tcp set global hystart=enabled';                       desc='HyStart slow-start: ON'}
+        # === CONGESTION CONTROL & ECN (Explicit Congestion Notification) ===
+        # ECN allows routers to mark packets as congested instead of dropping them.
+        # PRR = better recovery after packet loss (RFC 6937).
+        # HyStart = smarter slow-start phase, prevents window collapse.
+        @{c="netsh int tcp set supplemental internet congestionprovider=$congestion"; desc="Congestion provider: $congestion  [TCP congestion control algorithm]"}
+        @{c='netsh int tcp set global ecncapability=enabled';                 desc='ECN: ON  [graceful congestion handling, less packet loss]'}
+        @{c='netsh int tcp set global prr=enabled';                           desc='Proportional Rate Reduction: ON  [smarter loss recovery]'}
+        @{c='netsh int tcp set global hystart=enabled';                       desc='HyStart: ON  [improved slow-start, prevents congestion]'}
 
-        # === TIMING ===
-        @{c='netsh int tcp set global timestamps=disabled';                   desc='TCP Timestamps: OFF (mniejszy overhead)'}
-        @{c='netsh int tcp set global initialrto=2000';                       desc='Initial RTO: 2000ms'}
-        @{c='netsh int tcp set global nonsackrttresiliency=disabled';         desc='Non-SACK RTT resiliency: OFF'}
-        @{c='netsh int tcp set global maxsynretransmissions=2';               desc='Max SYN retransmissions: 2'}
-        @{c='netsh int tcp set global fastopen=enabled';                      desc='TCP Fast Open: ON (szybszy handshake)'}
-        @{c='netsh int tcp set global fastopenfallback=enabled';              desc='TFO Fallback: ON'}
+        # === TIMING & RETRANSMISSION ===
+        # Timestamps OFF saves 12 bytes per packet (small but adds up at gigabit).
+        @{c='netsh int tcp set global timestamps=disabled';                   desc='TCP Timestamps: OFF  [saves 12 bytes/packet overhead]'}
+        @{c='netsh int tcp set global initialrto=2000';                       desc='Initial RTO: 2000ms  [Retransmission TimeOut for SYN]'}
+        @{c='netsh int tcp set global nonsackrttresiliency=disabled';         desc='Non-SACK RTT resiliency: OFF  [SACK is universal now]'}
+        @{c='netsh int tcp set global maxsynretransmissions=2';               desc='Max SYN retransmissions: 2  [faster failover to next host]'}
+        @{c='netsh int tcp set global fastopen=enabled';                      desc='TCP Fast Open: ON  [skip 1-RTT handshake on resumed connections]'}
+        @{c='netsh int tcp set global fastopenfallback=enabled';              desc='TFO Fallback: ON  [graceful fallback if peer does not support TFO]'}
 
-        # === PACING (zostaw default - off psuje sieci 1Gbps+) ===
-        @{c='netsh int tcp set global pacingprofile=off';                     desc='TCP Pacing: OFF'}
+        # === PACING (rate-limiting, off for max bandwidth) ===
+        @{c='netsh int tcp set global pacingprofile=off';                     desc='TCP Pacing: OFF  [no artificial rate limiting]'}
 
-        # === IP STACK ===
-        @{c='netsh int ip   set global taskoffload=enabled';                  desc='IP Task Offload: ON'}
-        @{c='netsh int ip   set global neighborcachelimit=8192';              desc='Neighbor cache: 8192'}
-        @{c='netsh int ip   set global icmpredirects=disabled';               desc='ICMP redirects: OFF (security)'}
-        @{c='netsh int ip   set global sourceroutingbehavior=drop';           desc='Source routing: DROP (security)'}
+        # === IP STACK GLOBAL ===
+        @{c='netsh int ip   set global taskoffload=enabled';                  desc='IP Task Offload: ON  [hardware acceleration for IP processing]'}
+        @{c='netsh int ip   set global neighborcachelimit=8192';              desc='ARP Neighbor cache: 8192 entries  [larger LAN support]'}
+        @{c='netsh int ip   set global icmpredirects=disabled';               desc='ICMP redirects: OFF  [SECURITY: prevents redirect attacks]'}
+        @{c='netsh int ip   set global sourceroutingbehavior=drop';           desc='Source routing: DROP  [SECURITY: prevents IP spoofing]'}
 
-        # === UDP (gaming traffic) ===
-        @{c='netsh int udp set global uro=enabled';                           desc='UDP Receive Offload: ON'}
+        # === UDP (gaming/VoIP traffic) ===
+        @{c='netsh int udp set global uro=enabled';                           desc='UDP Receive Offload: ON  [hardware UDP coalescing]'}
 
-        # === Winsock reset jest CELOWO pominiete ===
-        # 'netsh winsock reset' moze zlamac VPN klientow / antivirusy z LSP.
-        # Uruchom recznie tylko gdy masz problemy z polaczeniem!
+        # === NOTE: 'netsh winsock reset' is INTENTIONALLY skipped ===
+        # It can break VPN clients and antiviruses that register Layered Service Providers.
+        # Run it manually only if you have specific connection issues.
     )
 
     foreach ($cmd in $cmds) {
         try {
             $out = cmd.exe /c $cmd.c 2>&1
             if ($LASTEXITCODE -eq 0 -or $out -match 'OK|Ok') {
-                Write-OK $cmd.desc
+                Write-Apply $cmd.desc
             } else {
                 Write-Warn ("{0}  ({1})" -f $cmd.desc, (($out -join ' ').Trim() -replace '\s+', ' '))
             }
@@ -696,39 +848,45 @@ function Optimize-TcpIpGlobal {
 }
 
 # ============================================================
-#   REGISTRY TWEAKS (TCP/IP performance)
-#   HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+#   REGISTRY TWEAKS - TCP/IP STACK PERFORMANCE
+#
+#   Modifies: HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+#
+#   These are deeper kernel-level TCP settings that complement
+#   netsh changes. Some require reboot to take effect.
+#
+#   Sources: Microsoft KB, Reddit r/pcmasterrace, guru3D Forums,
+#            Windows Forum, BlurBusters network optimization guide.
 # ============================================================
 function Set-TcpIpRegistryTweaks {
     param([string]$ModeName = 'Throughput')
-    Write-Section "REGISTRY TWEAKS - TCP/IP STACK  (tryb: $ModeName)"
+    Write-Section "REGISTRY TWEAKS - TCP/IP STACK  (mode: $ModeName)"
 
     $tcpParams = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
 
-    # Tweaks zebrane z: Microsoft Learn, Reddit r/pcmasterrace, guru3D, Windows Forum
     $tweaks = @(
-        @{ Name='DefaultTTL';                Value=64;     Type='DWord'; Desc='Default TTL: 64 (standard)' }
-        @{ Name='Tcp1323Opts';               Value=1;      Type='DWord'; Desc='RFC 1323 Window Scaling: ON, Timestamps: OFF' }
-        @{ Name='TcpTimedWaitDelay';         Value=30;     Type='DWord'; Desc='TIME_WAIT delay: 30s (default 240s)' }
-        @{ Name='MaxUserPort';               Value=65534;  Type='DWord'; Desc='MaxUserPort: 65534 (default 5000)' }
-        @{ Name='TcpMaxDupAcks';             Value=2;      Type='DWord'; Desc='Max Duplicate ACKs: 2 (szybsze recovery)' }
-        @{ Name='SackOpts';                  Value=1;      Type='DWord'; Desc='Selective ACK: ON' }
-        @{ Name='EnablePMTUDiscovery';       Value=1;      Type='DWord'; Desc='Path MTU Discovery: ON' }
-        @{ Name='EnablePMTUBHDetect';        Value=0;      Type='DWord'; Desc='Black Hole Router Detection: OFF (false positives)' }
-        @{ Name='EnableTCPChimney';          Value=1;      Type='DWord'; Desc='TCP Chimney: ON' }
-        @{ Name='EnableTCPA';                Value=1;      Type='DWord'; Desc='TCP-A: ON' }
-        @{ Name='EnableRSS';                 Value=1;      Type='DWord'; Desc='RSS: ON (rejestr backup)' }
-        @{ Name='DisableTaskOffload';        Value=0;      Type='DWord'; Desc='Task Offload: enabled (0=ON)' }
-        @{ Name='MaxFreeTcbs';               Value=65536;  Type='DWord'; Desc='Max Free TCBs: 65536 (wiecej polaczen)' }
-        @{ Name='MaxHashTableSize';          Value=65536;  Type='DWord'; Desc='TCB Hash Table: 65536' }
-        @{ Name='GlobalMaxTcpWindowSize';    Value=65535;  Type='DWord'; Desc='Global Max TCP Window: 65535' }
-        @{ Name='TcpWindowSize';             Value=65535;  Type='DWord'; Desc='Default TCP Window: 65535' }
+        @{ Name='DefaultTTL';                Value=64;     Type='DWord'; Desc='DefaultTTL = 64  [standard hop limit, RFC compliant]' }
+        @{ Name='Tcp1323Opts';               Value=1;      Type='DWord'; Desc='RFC 1323 Options: window scaling ON, timestamps OFF' }
+        @{ Name='TcpTimedWaitDelay';         Value=30;     Type='DWord'; Desc='TIME_WAIT = 30s (default 240s)  [frees ports faster]' }
+        @{ Name='MaxUserPort';               Value=65534;  Type='DWord'; Desc='MaxUserPort = 65534 (default 5000)  [more ephemeral ports]' }
+        @{ Name='TcpMaxDupAcks';             Value=2;      Type='DWord'; Desc='Max Duplicate ACKs = 2  [faster fast-retransmit trigger]' }
+        @{ Name='SackOpts';                  Value=1;      Type='DWord'; Desc='Selective ACK = ON  [retransmit only lost segments]' }
+        @{ Name='EnablePMTUDiscovery';       Value=1;      Type='DWord'; Desc='Path MTU Discovery = ON  [auto-detect optimal packet size]' }
+        @{ Name='EnablePMTUBHDetect';        Value=0;      Type='DWord'; Desc='Black Hole Router Detection = OFF  [avoids false positives]' }
+        @{ Name='EnableTCPChimney';          Value=1;      Type='DWord'; Desc='TCP Chimney = ON  [hardware TCP offload backup setting]' }
+        @{ Name='EnableTCPA';                Value=1;      Type='DWord'; Desc='TCP-A = ON  [TCP acceleration]' }
+        @{ Name='EnableRSS';                 Value=1;      Type='DWord'; Desc='RSS = ON  [registry backup of netsh setting]' }
+        @{ Name='DisableTaskOffload';        Value=0;      Type='DWord'; Desc='Task Offload = enabled  [hardware checksum/offload]' }
+        @{ Name='MaxFreeTcbs';               Value=65536;  Type='DWord'; Desc='MaxFreeTcbs = 65536  [more concurrent connections]' }
+        @{ Name='MaxHashTableSize';          Value=65536;  Type='DWord'; Desc='TCB Hash Table = 65536  [faster connection lookup]' }
+        @{ Name='GlobalMaxTcpWindowSize';    Value=65535;  Type='DWord'; Desc='Global Max TCP Window = 65535  [max receive buffer]' }
+        @{ Name='TcpWindowSize';             Value=65535;  Type='DWord'; Desc='Default TCP Window = 65535  [initial receive buffer]' }
     )
 
     foreach ($t in $tweaks) {
         try {
             Set-ItemProperty -Path $tcpParams -Name $t.Name -Value $t.Value -Type $t.Type -Force -ErrorAction Stop
-            Write-OK $t.Desc
+            Write-Apply $t.Desc
         } catch {
             Write-Warn "$($t.Name): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
         }
@@ -736,27 +894,35 @@ function Set-TcpIpRegistryTweaks {
 }
 
 # ============================================================
-#   PER-INTERFACE NAGLE TWEAKS
-#   HKLM\...\Tcpip\Parameters\Interfaces\{GUID}
-#   TcpAckFrequency / TCPNoDelay = redukcja ping w gameach (~5-15ms)
+#   PER-INTERFACE NAGLE'S ALGORITHM DISABLE
+#
+#   Nagle's algorithm batches small TCP packets to reduce overhead.
+#   For gaming/VoIP it adds 5-15ms latency. We disable it here.
+#
+#   Registry: HKLM\...\Tcpip\Parameters\Interfaces\{GUID}
+#   - TcpAckFrequency = 1 (ACK every packet, not every 2)
+#   - TCPNoDelay      = 1 (disable Nagle, send small packets immediately)
+#   - TcpDelAckTicks  = 0 (no delayed ACK)
 # ============================================================
 function Set-InterfaceNagleTweaks {
     param([string]$ModeName = 'Throughput')
 
-    # Nagle tylko dla LowLatency / Balanced (w Throughput moze obnizyc throughput)
+    # Nagle disable hurts throughput by 5-10% so we skip in Throughput mode.
+    # Only apply to LowLatency / Balanced where ping matters more.
     if ($ModeName -eq 'Throughput') {
-        Write-Info "Nagle tweaks pominieto (tryb Throughput - moga obnizyc throughput o 5-10%)"
+        Write-Skip 'Nagle tweaks skipped (Throughput mode - they would lower bandwidth by 5-10%)'
         return
     }
 
-    Write-Section "PER-INTERFACE NAGLE OFF  (tryb: $ModeName)"
+    Write-Section "PER-INTERFACE NAGLE OFF  (mode: $ModeName)"
+    Write-Info 'Disabling Nagle reduces ping by 5-15ms in games (CS2, Valorant, etc.)'
 
     $base = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces'
     $interfaces = Get-ChildItem -Path $base -ErrorAction SilentlyContinue
 
     $count = 0
     foreach ($iface in $interfaces) {
-        # Tylko interfejsy z przypisanym IP (aktywne)
+        # Only apply to interfaces with an assigned IP (skip inactive)
         $props = Get-ItemProperty -Path $iface.PSPath -ErrorAction SilentlyContinue
         if (-not $props.IPAddress -and -not $props.DhcpIPAddress) { continue }
 
@@ -765,52 +931,62 @@ function Set-InterfaceNagleTweaks {
             Set-ItemProperty -Path $iface.PSPath -Name 'TCPNoDelay'      -Value 1 -Type DWord -Force -ErrorAction Stop
             Set-ItemProperty -Path $iface.PSPath -Name 'TcpDelAckTicks'  -Value 0 -Type DWord -Force -ErrorAction Stop
             $ip = if ($props.DhcpIPAddress) { $props.DhcpIPAddress } else { $props.IPAddress }
-            Write-OK "Interfejs $ip : TcpAckFrequency=1, TCPNoDelay=1, TcpDelAckTicks=0"
+            Write-Apply "Interface $ip : TcpAckFrequency=1, TCPNoDelay=1, TcpDelAckTicks=0"
             $count++
         } catch {
             Write-Warn "$($iface.PSChildName): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
         }
     }
     if ($count -eq 0) {
-        Write-Warn 'Nie znaleziono aktywnych interfejsow z IP'
+        Write-Warn 'No active interfaces with IP found - Nagle tweaks not applied'
     }
 }
 
 # ============================================================
-#   MMCSS OPTIMIZATION (Multimedia Class Scheduler)
-#   - NetworkThrottlingIndex = 0xFFFFFFFF -> wylaczone throttling sieci
-#   - SystemResponsiveness   = 10  (default 20, dla gamingu)
-#   - Tasks\Games priority boost
+#   MMCSS - MULTIMEDIA CLASS SCHEDULER SERVICE
+#
+#   By default Windows reserves 20% CPU for "other" tasks even
+#   when multimedia (games, streams) needs it. We tell Windows
+#   to give multimedia priority.
+#
+#   Two main settings:
+#   - NetworkThrottlingIndex = 0xFFFFFFFF (-1) -> NO network throttling
+#     (default ~10 = 1 packet per 10ms when multimedia detected)
+#   - SystemResponsiveness = 10 or 0
+#     (default 20 = reserve 20% CPU for non-multimedia)
+#
+#   Plus we boost Tasks\Games priority for FPS/latency.
 # ============================================================
 function Set-MmcssOptimization {
     param([string]$ModeName = 'Throughput')
-    Write-Section "MMCSS - MULTIMEDIA SCHEDULER  (tryb: $ModeName)"
+    Write-Section "MMCSS - MULTIMEDIA SCHEDULER  (mode: $ModeName)"
 
     $sysProfile = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
     $games      = "$sysProfile\Tasks\Games"
 
-    # SystemResponsiveness:
-    # 0  = 100% CPU dla multimedia/gier (max gaming)
-    # 10 = 90% multimedia, 10% inne (zalecane Microsoft)
-    # 20 = default (Windows zostawia 20% dla "innych" zadan)
+    # SystemResponsiveness scale:
+    #   0  = 100% CPU available to multimedia (best for competitive gaming)
+    #   10 = 90% multimedia / 10% other (recommended Microsoft)
+    #   20 = default (Windows reserves 20% for other tasks)
     $sysResp = if ($ModeName -eq 'LowLatency') { 0 } else { 10 }
 
     $tweaks = @(
-        # 0xFFFFFFFF jako DWord = -1 (signed int32, ten sam bit pattern)
-        @{ Path=$sysProfile; Name='NetworkThrottlingIndex';   Value=([int]-1);  Type='DWord'; Desc='Network Throttling: WYLACZONE (max throughput)' }
-        @{ Path=$sysProfile; Name='SystemResponsiveness';     Value=$sysResp;   Type='DWord'; Desc="System Responsiveness: $sysResp" }
+        # 0xFFFFFFFF as DWord = -1 (signed int32, same bit pattern)
+        # This is THE KEY TWEAK - removes network packet throttling entirely.
+        @{ Path=$sysProfile; Name='NetworkThrottlingIndex';   Value=([int]-1);  Type='DWord'; Desc='NetworkThrottlingIndex = 0xFFFFFFFF  [DISABLES network throttling]' }
+        @{ Path=$sysProfile; Name='SystemResponsiveness';     Value=$sysResp;   Type='DWord'; Desc="SystemResponsiveness = $sysResp  [% CPU reserved for non-multimedia tasks]" }
 
-        # Boost dla zadan typu Games
-        @{ Path=$games;      Name='GPU Priority';             Value=8;   Type='DWord'; Desc='Games\GPU Priority: 8 (max)' }
-        @{ Path=$games;      Name='Priority';                 Value=6;   Type='DWord'; Desc='Games\Priority: 6 (high)' }
-        @{ Path=$games;      Name='Scheduling Category';      Value='High';        Type='String'; Desc='Games\Scheduling: High' }
-        @{ Path=$games;      Name='SFIO Priority';            Value='High';        Type='String'; Desc='Games\SFIO Priority: High' }
-        @{ Path=$games;      Name='Affinity';                 Value=0;   Type='DWord'; Desc='Games\Affinity: 0 (wszystkie CPU)' }
-        @{ Path=$games;      Name='Background Only';          Value='False';       Type='String'; Desc='Games\Background Only: False' }
-        @{ Path=$games;      Name='Clock Rate';               Value=10000; Type='DWord'; Desc='Games\Clock Rate: 10000' }
+        # Boost for tasks classified as 'Games' (DirectX games auto-register)
+        @{ Path=$games;      Name='GPU Priority';             Value=8;   Type='DWord'; Desc='Games\GPU Priority = 8  [maximum GPU priority for games]' }
+        @{ Path=$games;      Name='Priority';                 Value=6;   Type='DWord'; Desc='Games\Priority = 6  [high CPU priority]' }
+        @{ Path=$games;      Name='Scheduling Category';      Value='High';        Type='String'; Desc='Games\Scheduling = High  [scheduling class above normal]' }
+        @{ Path=$games;      Name='SFIO Priority';            Value='High';        Type='String'; Desc='Games\SFIO Priority = High  [scheduled file I/O priority]' }
+        @{ Path=$games;      Name='Affinity';                 Value=0;   Type='DWord'; Desc='Games\Affinity = 0  [allow all CPU cores]' }
+        @{ Path=$games;      Name='Background Only';          Value='False';       Type='String'; Desc='Games\Background Only = False  [foreground priority]' }
+        @{ Path=$games;      Name='Clock Rate';               Value=10000; Type='DWord'; Desc='Games\Clock Rate = 10000  [scheduling timer 10us]' }
     )
 
-    # Upewnij sie ze klucze istnieja
+    # Ensure registry keys exist (some Win versions don't have Tasks\Games by default)
     foreach ($p in @($sysProfile, $games)) {
         if (-not (Test-Path $p)) {
             try { New-Item -Path $p -Force | Out-Null } catch { }
@@ -820,7 +996,7 @@ function Set-MmcssOptimization {
     foreach ($t in $tweaks) {
         try {
             Set-ItemProperty -Path $t.Path -Name $t.Name -Value $t.Value -Type $t.Type -Force -ErrorAction Stop
-            Write-OK $t.Desc
+            Write-Apply $t.Desc
         } catch {
             Write-Warn "$($t.Name): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
         }
@@ -828,41 +1004,46 @@ function Set-MmcssOptimization {
 }
 
 # ============================================================
-#   POWER TWEAKS (powercfg)
-#   - USB Selective Suspend OFF
-#   - PCI-Express Link State Power Management OFF
-#   - Min CPU State 100% on AC
+#   POWERCFG TWEAKS - DEEP POWER MANAGEMENT
+#
+#   Disables aggressive power saving features that hurt network/CPU performance:
+#   - USB Selective Suspend OFF (USB devices stay always-on)
+#   - PCIe Link State Power Mgmt OFF (PCIe never goes to sleep)
+#   - Minimum CPU State = 100% on AC (CPU never throttles below 100%)
+#   - Wireless adapter Maximum Performance (no WiFi power saving)
+#
+#   GUIDs are well-known Windows power setting identifiers.
 # ============================================================
 function Set-PowerCfgTweaks {
-    Write-Section 'POWERCFG - GLEBOKA OPTYMALIZACJA ZASILANIA'
+    Write-Section 'POWERCFG - DEEP POWER MANAGEMENT TUNING'
 
     $cmds = @(
-        # USB Selective Suspend
-        @{c='powercfg /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0'; desc='USB Selective Suspend (AC): OFF'}
-        @{c='powercfg /setdcvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0'; desc='USB Selective Suspend (Battery): OFF'}
+        # USB Selective Suspend - prevents USB ports from sleeping (USB NICs)
+        @{c='powercfg /setacvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0'; desc='USB Selective Suspend (AC) = OFF  [USB devices stay powered on]'}
+        @{c='powercfg /setdcvalueindex SCHEME_CURRENT 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0'; desc='USB Selective Suspend (Battery) = OFF'}
 
-        # PCI Express Link State Power Management
-        @{c='powercfg /setacvalueindex SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0'; desc='PCIe Link State Power Mgmt (AC): OFF'}
-        @{c='powercfg /setdcvalueindex SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0'; desc='PCIe Link State Power Mgmt (Battery): OFF'}
+        # PCIe Link State Power Management - prevents PCIe lanes from sleeping (NIC, SSD)
+        @{c='powercfg /setacvalueindex SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0'; desc='PCIe Link State Power Mgmt (AC) = OFF  [PCIe at full speed always]'}
+        @{c='powercfg /setdcvalueindex SCHEME_CURRENT 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0'; desc='PCIe Link State Power Mgmt (Battery) = OFF'}
 
-        # Minimum processor state
-        @{c='powercfg /setacvalueindex SCHEME_CURRENT 54533251-82be-4824-96c1-47b60b740d00 893dee8e-2bef-41e0-89c6-b55d0929964c 100'; desc='Min CPU State (AC): 100%'}
+        # Minimum processor state - prevents CPU from going below 100% on AC
+        @{c='powercfg /setacvalueindex SCHEME_CURRENT 54533251-82be-4824-96c1-47b60b740d00 893dee8e-2bef-41e0-89c6-b55d0929964c 100'; desc='Min CPU State (AC) = 100%  [no CPU throttling on AC power]'}
 
-        # Wireless adapter power mode
-        @{c='powercfg /setacvalueindex SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 0'; desc='Wireless Adapter (AC): Maximum Performance'}
+        # Wireless adapter power mode - max performance for WiFi cards
+        @{c='powercfg /setacvalueindex SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 0'; desc='Wireless Adapter (AC) = Max Performance  [no WiFi power saving]'}
 
-        # Hard disk timeout (0 = never)
-        @{c='powercfg /setacvalueindex SCHEME_CURRENT 0012ee47-9041-4b5d-9b77-535fba8b1442 6738e2c4-e8a5-4a42-b16a-e040e769756e 0'; desc='HDD timeout (AC): never'}
+        # Hard disk timeout (0 = never spin down)
+        @{c='powercfg /setacvalueindex SCHEME_CURRENT 0012ee47-9041-4b5d-9b77-535fba8b1442 6738e2c4-e8a5-4a42-b16a-e040e769756e 0'; desc='HDD timeout (AC) = never  [HDDs stay spinning, no spin-up delay]'}
 
-        # Apply
-        @{c='powercfg /setactive SCHEME_CURRENT'; desc='Apply current power scheme'}
+        # Apply changes to current scheme
+        @{c='powercfg /setactive SCHEME_CURRENT'; desc='Apply changes to current power scheme'}
     )
 
     foreach ($cmd in $cmds) {
         try {
             $out = cmd.exe /c $cmd.c 2>&1
             if ($LASTEXITCODE -eq 0) {
-                Write-OK $cmd.desc
+                Write-Apply $cmd.desc
             } else {
                 Write-Warn ("{0}  ({1})" -f $cmd.desc, (($out -join ' ').Trim()))
             }
@@ -873,53 +1054,95 @@ function Set-PowerCfgTweaks {
 }
 
 # ============================================================
-#   DISABLE TELEMETRY SERVICES (uwalnia bandwidth)
+#   DISABLE TELEMETRY SERVICES (frees up bandwidth)
+#
+#   Microsoft telemetry services consume ~1-5% bandwidth in idle.
+#   Disabling them is opt-in only (some users want diagnostics).
+#
+#   Services disabled:
+#   - DiagTrack          (Connected User Experiences and Telemetry)
+#   - dmwappushservice   (WAP Push Message Routing - mobile/legacy)
+#   - WMPNetworkSvc      (Windows Media Player Network Sharing)
+#
+#   Plus: Delivery Optimization (Windows Update P2P uploads)
 # ============================================================
 function Disable-TelemetryServices {
-    Write-Section 'WYLACZANIE TELEMETRII (DiagTrack, dmwappushservice)'
+    Write-Section 'TELEMETRY OFF  (DiagTrack, Delivery Opt., WMP Network)'
+    Write-Info 'These services consume bandwidth in the background.'
+    Write-Info 'Disabling them frees up upload bandwidth and reduces background traffic.'
 
-    $services = @('DiagTrack', 'dmwappushservice', 'WMPNetworkSvc')
+    $services = @(
+        @{ Name='DiagTrack';        Desc='Connected User Experiences and Telemetry (main telemetry)' }
+        @{ Name='dmwappushservice'; Desc='WAP Push Message Routing (mobile/legacy, safe to disable)' }
+        @{ Name='WMPNetworkSvc';    Desc='Windows Media Player Network Sharing (rarely used)' }
+    )
+
     foreach ($svc in $services) {
         try {
-            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            $s = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
             if (-not $s) {
-                Write-Info "$svc : nie znaleziono (OK)"
+                Write-Skip "$($svc.Name) : not present on this Windows (OK)"
                 continue
             }
             if ($s.Status -eq 'Running') {
-                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
             }
-            Set-Service -Name $svc -StartupType Disabled -ErrorAction Stop
-            Write-OK "$svc : zatrzymane i wylaczone"
+            Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction Stop
+            Write-Apply "$($svc.Name)  =  STOPPED + DISABLED  [$($svc.Desc)]"
         } catch {
-            Write-Warn "$svc : $($_.Exception.Message)"
+            Write-Warn "$($svc.Name) : $($_.Exception.Message)"
         }
     }
 
-    # Wylacz Delivery Optimization (P2P Windows Update)
+    # Disable Delivery Optimization - P2P Windows Update upload (major bandwidth eater)
     try {
         $doPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'
         if (-not (Test-Path $doPath)) { New-Item -Path $doPath -Force | Out-Null }
         Set-ItemProperty -Path $doPath -Name 'DODownloadMode' -Value 0 -Type DWord -Force
-        Write-OK 'Delivery Optimization: OFF (P2P Windows Update)'
+        Write-Apply 'Delivery Optimization = OFF  [no P2P upload of Windows Updates to other PCs]'
     } catch {
         Write-Warn "Delivery Optimization: $($_.Exception.Message)"
     }
 }
 
 # ============================================================
-#   MTU AUTO-DETECTION (informacyjne)
+#   MTU AUTO-DETECTION via ICMP fragmentation test
+#
+#   Algorithm:
+#   1. Send ping with 'Don't Fragment' flag set (-f)
+#   2. Try sizes between 1300-1500 bytes (binary search)
+#   3. Largest size that returns reply = max payload
+#   4. Optimal MTU = payload + 28 (IP+ICMP headers)
+#
+#   FIXED: Earlier version used 'Reply from' string match which
+#   failed on non-English Windows (Polish: 'Odpowiedz od'). Now
+#   we check ping.exe exit code which is locale-independent.
 # ============================================================
 function Test-OptimalMtu {
-    Write-Section 'MTU - AUTOMATYCZNA DETEKCJA'
-    Write-Info 'Test moze potrwac ~30 sekund...'
+    Write-Section 'MTU AUTO-DETECTION  (binary search via ICMP)'
+    Write-Info 'This test takes ~30 seconds. Measures optimal packet size for your link.'
 
-    $target = '1.1.1.1'
+    # Try multiple targets in case one is blocked by firewall
+    $targets = @('1.1.1.1', '8.8.8.8', '9.9.9.9')
+    $target = $null
+    foreach ($t in $targets) {
+        $null = ping.exe -n 1 -w 1500 $t 2>&1
+        if ($LASTEXITCODE -eq 0) { $target = $t; break }
+    }
+    if (-not $target) {
+        Write-Warn 'No target reachable (all blocked?). MTU detection skipped.'
+        Write-Info 'You can run manually: ping -f -l <SIZE> 1.1.1.1'
+        return
+    }
+    Write-Info "Testing against: $target"
+
     $low = 1300; $high = 1500; $best = 0
     while ($low -le $high) {
         $mid = [int](($low + $high) / 2)
-        $result = ping.exe -f -l $mid -n 1 -w 1500 $target 2>&1
-        if ($result -match 'Reply from') {
+        # -f sets Don't Fragment bit, -l sets payload size, -n 1 = one ping
+        $null = ping.exe -f -l $mid -n 1 -w 1500 $target 2>&1
+        # FIX: Use exit code instead of 'Reply from' string (locale-independent)
+        if ($LASTEXITCODE -eq 0) {
             $best = $mid
             $low = $mid + 1
         } else {
@@ -927,115 +1150,167 @@ function Test-OptimalMtu {
         }
     }
     if ($best -gt 0) {
-        $optimalMtu = $best + 28  # +20 IP header + 8 ICMP header
-        Write-OK "Optymalne MTU: $optimalMtu  (payload max: $best)"
-        Write-Info "Aktualne MTU mozna sprawdzic: netsh int ipv4 show subinterfaces"
-        Write-Info "Dla Orange PPPoE typowo 1492 jest poprawne"
+        $optimalMtu = $best + 28  # +20 IP header + 8 ICMP header = 28 bytes overhead
+        Write-OK "Optimal MTU detected: $optimalMtu  (max ICMP payload: $best bytes)"
+        Write-Info 'Reference values:'
+        Write-Info '   1500 = standard Ethernet (most ISPs)'
+        Write-Info '   1492 = PPPoE links (DSL, fiber with PPPoE)'
+        Write-Info '   1480 = some 4G/5G mobile links'
+        Write-Info '   9000 = Jumbo frames (only if entire path supports it)'
+        Write-Info 'Check current MTU via: netsh int ipv4 show subinterfaces'
     } else {
-        Write-Warn 'Nie udalo sie wykryc MTU (firewall blokuje ICMP?)'
+        Write-Warn 'Could not determine MTU (firewall blocking ICMP?). This is informational only.'
     }
 }
 
+# Activates the highest performance Windows power plan available.
+# Tries: Ultimate Performance -> High Performance (failsafe for older Windows).
 function Set-PerformancePowerPlan {
-    Write-Section 'PLAN ZASILANIA WINDOWS'
+    Write-Section 'WINDOWS POWER PLAN ACTIVATION'
     try {
-        $ultimate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
-        $highPerf = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+        # Well-known Windows power plan GUIDs
+        $ultimate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'  # Ultimate Performance (Win 10/11 Pro)
+        $highPerf = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'  # High Performance (universal)
 
-        # Try Ultimate first, fall back to High Performance
+        # Ultimate Performance is hidden by default on consumer Windows - duplicate to enable
         $schemes = (powercfg /list) -join "`n"
         if ($schemes -notmatch $ultimate) {
             powercfg -duplicatescheme $ultimate 2>&1 | Out-Null
         }
         powercfg /setactive $ultimate 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
+            # Fallback to High Performance if Ultimate is unavailable
             powercfg /setactive $highPerf 2>&1 | Out-Null
-            Write-OK 'Aktywowano plan: High Performance'
+            Write-Apply 'Active power plan = High Performance  [no CPU/disk power saving]'
         } else {
-            Write-OK 'Aktywowano plan: Ultimate Performance'
+            Write-Apply 'Active power plan = Ultimate Performance  [zero compromise mode]'
         }
     } catch {
         Write-Warn "Power plan: $($_.Exception.Message)"
     }
 }
 
+# Restores adapter settings from a JSON backup file.
+# User picks which backup to restore from a numbered list.
 function Restore-FromBackup {
-    Write-Section 'PRZYWRACANIE Z BACKUPU'
+    Write-Section 'ROLLBACK - RESTORE ADAPTER SETTINGS FROM BACKUP'
     if (-not (Test-Path $BackupDir)) {
-        Write-Err "Brak folderu z backupami: $BackupDir"
+        Write-Err "No backup folder found at: $BackupDir"
         return
     }
     $backups = Get-ChildItem $BackupDir -Filter '*.json' | Sort-Object LastWriteTime -Descending
-    if (-not $backups) { Write-Err 'Brak plikow backupu'; return }
+    if (-not $backups) { Write-Err 'No backup files in folder'; return }
 
-    Write-Host 'Dostepne backupy (najnowsze pierwsze):'
+    Write-Host ''
+    Write-Host '  Available backups (newest first):' -ForegroundColor White
     for ($i = 0; $i -lt $backups.Count; $i++) {
-        Write-Host ("  [{0}] {1}    ({2})" -f $i, $backups[$i].Name, $backups[$i].LastWriteTime)
+        Write-Host ("    [{0,2}]  {1}" -f $i, $backups[$i].Name) -NoNewline -ForegroundColor White
+        Write-Host ("    ({0})" -f $backups[$i].LastWriteTime) -ForegroundColor DarkGray
     }
-    $idx = Read-Host 'Numer backupu do przywrocenia (Enter = anuluj)'
-    if ([string]::IsNullOrWhiteSpace($idx)) { return }
+    Write-Host ''
+    $idx = Read-Host 'Backup number to restore (Enter to cancel)'
+    if ([string]::IsNullOrWhiteSpace($idx)) {
+        Write-Info 'Restore cancelled by user'
+        return
+    }
 
     $file        = $backups[[int]$idx].FullName
     $data        = Get-Content $file -Raw | ConvertFrom-Json
     $adapterName = ($backups[[int]$idx].BaseName -replace '--\d{8}-\d{6}$', '') -replace '_', ' '
 
-    Write-Info "Karta: $adapterName"
+    Write-Info "Restoring to adapter: $adapterName"
     foreach ($p in $data) {
         try {
             Set-NetAdapterAdvancedProperty -Name $adapterName -DisplayName $p.DisplayName `
                 -DisplayValue $p.DisplayValue -NoRestart -ErrorAction Stop
-            Write-OK "$($p.DisplayName)  ->  $($p.DisplayValue)"
+            Write-Apply "$($p.DisplayName)  ->  $($p.DisplayValue)"
         } catch {
             Write-Warn "$($p.DisplayName): $($_.Exception.Message)"
         }
     }
     Restart-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue
-    Write-OK 'Przywrocono ustawienia, karta zrestartowana'
+    Write-OK 'Settings restored from backup. Adapter restarted.'
 }
 
 # ============================================================
-#   MAIN
+#   MAIN EXECUTION FLOW
+#
+#   Phase 1: Per-adapter optimization (settings + power mgmt + DNS)
+#   Phase 2: Global TCP/IP tuning (netsh)
+#   Phase 3: Registry tweaks (TCP stack, Nagle, MMCSS) - optional
+#   Phase 4: Power management (powercfg + Ultimate plan)
+#   Phase 5: Telemetry off - optional
+#   Phase 6: MTU auto-detection - informational
 # ============================================================
 Clear-Host
-Write-Host @"
-+==================================================================+
-|         WINDOWS NETWORK OPTIMIZER  v3.0                          |
-|         universal - works on Win 8.1/10/11/Server 2012R2+        |
-+==================================================================+
-|  OS:      $($Global:WinInfo.Name.PadRight(56))|
-|  Build:   $($Global:WinInfo.BuildNumber.ToString().PadRight(56))|
-|  PSVer:   $($Global:WinInfo.PSVersion.PadRight(56))|
-|                                                                  |
-|  Mode:           $($Mode.PadRight(49))|
-|  Telemetry off:  $($DisableTelemetry.ToString().PadRight(49))|
-|  Skip registry:  $($NoRegistry.ToString().PadRight(49))|
-|  Skip MTU test:  $($NoMtuTest.ToString().PadRight(49))|
-|  Silent mode:    $($Silent.ToString().PadRight(49))|
-+==================================================================+
-"@ -ForegroundColor Cyan
 
+# --- Multi-color banner ---
+$bannerBorder = '+' + ('=' * 66) + '+'
+Write-Host ''
+Write-Host $bannerBorder -ForegroundColor DarkCyan
+Write-Host '|         ' -NoNewline -ForegroundColor DarkCyan
+Write-Host 'WINDOWS NETWORK OPTIMIZER  v3.0' -NoNewline -ForegroundColor White
+Write-Host '                            |' -ForegroundColor DarkCyan
+Write-Host '|         ' -NoNewline -ForegroundColor DarkCyan
+Write-Host 'universal - Win 8.1 / 10 / 11 / Server 2012R2+' -NoNewline -ForegroundColor Cyan
+Write-Host '             |' -ForegroundColor DarkCyan
+Write-Host $bannerBorder -ForegroundColor DarkCyan
+
+function Write-BannerLine { param($k, $v, $vc='White')
+    Write-Host '|  ' -NoNewline -ForegroundColor DarkCyan
+    Write-Host ($k.PadRight(18)) -NoNewline -ForegroundColor Gray
+    Write-Host ($v.PadRight(46)) -NoNewline -ForegroundColor $vc
+    Write-Host '|' -ForegroundColor DarkCyan
+}
+
+Write-BannerLine 'OS:'           $Global:WinInfo.Name           'White'
+Write-BannerLine 'Build:'        $Global:WinInfo.BuildNumber    'White'
+Write-BannerLine 'PowerShell:'   $Global:WinInfo.PSVersion      'White'
+Write-BannerLine 'Architecture:' $Global:WinInfo.Architecture   'White'
+Write-Host '|' -NoNewline -ForegroundColor DarkCyan
+Write-Host (' ' * 66) -NoNewline
+Write-Host '|' -ForegroundColor DarkCyan
+
+$modeColor = switch ($Mode) {
+    'Throughput' { 'Green' }
+    'LowLatency' { 'Magenta' }
+    'Balanced'   { 'Yellow' }
+    default      { 'White' }
+}
+Write-BannerLine 'Mode:'         $Mode                                $modeColor
+Write-BannerLine 'Telemetry off:' $DisableTelemetry.ToString()        $(if($DisableTelemetry){'Yellow'}else{'DarkGray'})
+Write-BannerLine 'Skip registry:' $NoRegistry.ToString()              $(if($NoRegistry){'Yellow'}else{'DarkGray'})
+Write-BannerLine 'Skip MTU test:' $NoMtuTest.ToString()               $(if($NoMtuTest){'Yellow'}else{'DarkGray'})
+Write-BannerLine 'Silent mode:'   $Silent.ToString()                  $(if($Silent){'Yellow'}else{'DarkGray'})
+Write-Host $bannerBorder -ForegroundColor DarkCyan
+Write-Host ''
+
+# --- Restore mode bypasses normal flow ---
 if ($Restore) {
     Restore-FromBackup
-    if (-not $Silent) { Read-Host 'Enter aby zamknac' }
+    if (-not $Silent) { Read-Host 'Press Enter to exit' }
     exit
 }
 
 Show-Adapters
 
-# --- Choose adapter ---
+# ============================================================
+#   ADAPTER SELECTION
+# ============================================================
 if ($All) {
     $targets = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.MediaType -eq '802.3' }
-    if (-not $targets) { Write-Err 'Brak aktywnych kart Ethernet'; exit 1 }
+    if (-not $targets) { Write-Err 'No active Ethernet adapters found'; exit 1 }
+    Write-Info "Selected $($targets.Count) Ethernet adapter(s) (all active)"
 } elseif ($AdapterName) {
     $targets = Get-NetAdapter -Name $AdapterName -ErrorAction Stop
 } elseif ($Silent) {
-    # Silent + brak nazwy -> wszystkie aktywne Ethernet
+    # Silent mode without explicit name -> all active Ethernet
     $targets = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.MediaType -eq '802.3' }
-    if (-not $targets) { Write-Err 'Brak aktywnych kart Ethernet (silent mode)'; exit 1 }
+    if (-not $targets) { Write-Err 'No active Ethernet adapters found (silent mode)'; exit 1 }
 } else {
     Write-Host ''
-    Write-Info "Aktualny tryb: $Mode  (zmien przez -Mode Throughput|LowLatency|Balanced)"
-    $name = Read-Host 'Podaj nazwe karty (np. Ethernet) lub wpisz "all" dla wszystkich Ethernet'
+    Write-Tip "Current mode: $Mode  (change with -Mode Throughput|LowLatency|Balanced)"
+    $name = Read-Host 'Enter adapter name (e.g. Ethernet) or type "all" for all Ethernet adapters'
     if ($name -eq 'all') {
         $targets = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.MediaType -eq '802.3' }
     } else {
@@ -1043,20 +1318,31 @@ if ($All) {
     }
 }
 
-if (-not $targets) { Write-Err 'Nie znaleziono karty'; if(-not $Silent){Read-Host 'Enter'}; exit 1 }
+if (-not $targets) {
+    Write-Err 'No adapter found'
+    if (-not $Silent) { Read-Host 'Press Enter to exit' }
+    exit 1
+}
 
-# --- Resolve DNS provider ---
+# ============================================================
+#   DNS PROVIDER SELECTION
+# ============================================================
 $selectedDns = $null
 if ($PSBoundParameters.ContainsKey('DnsProvider')) {
     $selectedDns = Resolve-DnsProvider -InputValue $DnsProvider
+    if ($selectedDns) {
+        Write-Info "DNS provider selected via parameter: $($selectedDns.Name)"
+    } else {
+        Write-Info 'DNS will not be changed (Skip / invalid)'
+    }
 } elseif (-not $Silent) {
-    # Interactive menu
+    # Interactive prompt with menu
     Write-Host ''
-    $useDns = Read-Host 'Czy zmienic DNS? (T = pokaz menu / N = pomin) [N]'
-    if ($useDns -match '^[TtYy]') {
+    $useDns = Read-Host 'Change DNS settings? (Y = show menu / N = skip) [N]'
+    if ($useDns -match '^[YyTt]') {
         $choice = Show-DnsMenu
         if ($choice -match '^[Cc]') {
-            $custom = Read-Host 'Podaj adresy DNS (np. 1.1.1.1,9.9.9.9)'
+            $custom = Read-Host 'Enter custom DNS IPs (comma-separated, e.g. 1.1.1.1,9.9.9.9)'
             $selectedDns = Resolve-DnsProvider -InputValue $custom
         } else {
             $selectedDns = Resolve-DnsProvider -InputValue $choice
@@ -1064,7 +1350,9 @@ if ($PSBoundParameters.ContainsKey('DnsProvider')) {
     }
 }
 
-# === FAZA 1: Karta sieciowa (per-adapter) ===
+# ============================================================
+#   PHASE 1: PER-ADAPTER OPTIMIZATION
+# ============================================================
 foreach ($t in $targets) {
     Optimize-Adapter         $t.Name
     Disable-PowerManagement  $t.Name
@@ -1073,66 +1361,94 @@ foreach ($t in $targets) {
     }
 }
 
-# === FAZA 2: TCP/IP global (netsh) ===
+# ============================================================
+#   PHASE 2: GLOBAL TCP/IP TUNING (netsh)
+# ============================================================
 Optimize-TcpIpGlobal -ModeName $Mode
 
-# === FAZA 3: Registry tweaks (TCP/IP stack + MMCSS + Nagle) ===
+# ============================================================
+#   PHASE 3: REGISTRY TWEAKS (TCP stack + Nagle + MMCSS)
+# ============================================================
 if (-not $NoRegistry) {
     Set-TcpIpRegistryTweaks   -ModeName $Mode
     Set-InterfaceNagleTweaks  -ModeName $Mode
     Set-MmcssOptimization     -ModeName $Mode
 } else {
-    Write-Info 'Pominieto registry tweaks (-NoRegistry)'
+    Write-Skip 'Registry tweaks skipped (-NoRegistry parameter)'
 }
 
-# === FAZA 4: Power management ===
+# ============================================================
+#   PHASE 4: POWER MANAGEMENT (powercfg + Ultimate plan)
+# ============================================================
 Set-PowerCfgTweaks
 Set-PerformancePowerPlan
 
-# === FAZA 5: Telemetry off (opcjonalne) ===
+# ============================================================
+#   PHASE 5: TELEMETRY OFF (opt-in only)
+# ============================================================
 if ($DisableTelemetry) {
     Disable-TelemetryServices
 } else {
-    Write-Info 'Telemetria nie zostala wylaczona (uzyj -DisableTelemetry aby wylaczyc DiagTrack)'
+    Write-Info 'Telemetry was NOT disabled (use -DisableTelemetry to disable DiagTrack)'
 }
 
-# === FAZA 6: MTU detection (informacyjne) ===
+# ============================================================
+#   PHASE 6: MTU AUTO-DETECTION (informational)
+# ============================================================
 if (-not $NoMtuTest) {
     Test-OptimalMtu
+} else {
+    Write-Skip 'MTU test skipped (-NoMtuTest parameter)'
 }
 
-Write-Section 'ZAKONCZONO'
-Write-OK   'Optymalizacja wykonana pomyslnie'
-Write-Info "Tryb: $Mode"
-if ($selectedDns) { Write-Info "DNS: $($selectedDns.Name)" }
-Write-Info "Backup ustawien: $BackupDir"
-Write-Info 'Cofniecie zmian karty: uruchom z parametrem -Restore'
-Write-Warn 'WYMAGANY RESTART komputera dla pelnego efektu!'
-Write-Warn '(Niektore tweaks rejestru aktywuja sie dopiero po reboot)'
+# ============================================================
+#   FINAL SUMMARY
+# ============================================================
+Write-Section 'OPTIMIZATION COMPLETE'
+Write-OK   'All optimizations applied successfully'
+Write-Info "Mode used: $Mode"
+if ($selectedDns) { Write-Info "DNS provider: $($selectedDns.Name)" }
+Write-Info "Backup folder: $BackupDir"
+Write-Tip  'To rollback adapter changes, run with -Restore parameter'
+Write-Host ''
+Write-Warn 'REBOOT YOUR COMPUTER for full effect!'
+Write-Warn 'Some registry/TCP tweaks only activate after reboot.'
 
 Write-Host ''
 Show-Adapters
 
-# Pokaz summary co zostalo zrobione
-Write-Section 'PODSUMOWANIE WYKONANYCH OPTYMALIZACJI'
-Write-Host '  [+] Karta sieciowa: ~40 ustawien zaawansowanych'         -ForegroundColor Green
-Write-Host '  [+] Power management: wylaczone wylaczanie do oszczednosci' -ForegroundColor Green
-Write-Host '  [+] TCP/IP netsh: 24 ustawienia globalne'                -ForegroundColor Green
+# --- Color-coded summary of what was done ---
+Write-Section 'SUMMARY OF APPLIED OPTIMIZATIONS'
+function Write-Summary { param($status, $what)
+    Write-Host '  [' -NoNewline -ForegroundColor DarkGray
+    Write-Host '+' -NoNewline -ForegroundColor Green
+    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host $what -ForegroundColor White
+}
+
+Write-Summary 'OK' "Network adapter ($($targets.Count) interface): ~40 advanced settings tuned"
+Write-Summary 'OK' 'Power Management: Windows device sleep disabled per adapter'
+Write-Summary 'OK' 'TCP/IP global (netsh): 24 settings (autotuning, RSS, ECN, HyStart...)'
 if (-not $NoRegistry) {
-    Write-Host '  [+] Registry TCP/IP: 16 wartosci wydajnosciowych'     -ForegroundColor Green
-    Write-Host '  [+] MMCSS: NetworkThrottlingIndex, Games priority'    -ForegroundColor Green
+    Write-Summary 'OK' 'Registry TCP/IP: 16 stack performance values'
+    Write-Summary 'OK' 'MMCSS: NetworkThrottlingIndex disabled, Games priority boosted'
     if ($Mode -ne 'Throughput') {
-        Write-Host '  [+] Per-NIC Nagle off: TcpAckFrequency=1, TCPNoDelay=1' -ForegroundColor Green
+        Write-Summary 'OK' 'Per-NIC Nagle OFF: TcpAckFrequency=1, TCPNoDelay=1 (lower ping)'
     }
 }
-Write-Host '  [+] Powercfg: USB Suspend off, PCIe LSPM off, CPU 100%'  -ForegroundColor Green
-Write-Host '  [+] Plan zasilania: Ultimate Performance'                -ForegroundColor Green
+Write-Summary 'OK' 'Powercfg: USB Suspend OFF, PCIe LSPM OFF, CPU min 100%'
+Write-Summary 'OK' 'Active power plan: Ultimate Performance (or High Performance)'
 if ($selectedDns) {
-    Write-Host "  [+] DNS: $($selectedDns.Name) ($($selectedDns.V4 -join ', '))" -ForegroundColor Green
+    Write-Summary 'OK' "DNS configured: $($selectedDns.Name) ($($selectedDns.V4 -join ', '))"
 }
 if ($DisableTelemetry) {
-    Write-Host '  [+] Telemetria: wylaczona (DiagTrack, Delivery Opt.)' -ForegroundColor Green
+    Write-Summary 'OK' 'Telemetry services disabled (DiagTrack, Delivery Optimization)'
 }
 
 Write-Host ''
-if (-not $Silent) { Read-Host 'Nacisnij Enter aby zamknac' }
+Write-Host '  Repository: ' -NoNewline -ForegroundColor DarkGray
+Write-Host 'https://github.com/Rezurmas/windows-network-optimizer' -ForegroundColor Cyan
+Write-Host '  Issues / Stars / PRs welcome!' -ForegroundColor DarkGray
+Write-Host ''
+
+if (-not $Silent) { Read-Host 'Press Enter to exit' }

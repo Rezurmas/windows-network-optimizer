@@ -1690,7 +1690,7 @@ function Write-BannerLine { param($k, $v, $vc=$White)
 
 Write-Host ''
 # -- Top box: title + subtitle --
-$title    = 'WINDOWS NETWORK OPTIMIZER  v3.1-dev'
+$title    = 'WINDOWS NETWORK OPTIMIZER  v4.0'
 $subtitle = 'universal · Win 7 SP1+ / 8.1 / 10 / 11'
 $tPad = $innerWidth - $title.Length;    $tL = [Math]::Floor($tPad/2); $tR = $tPad - $tL
 $sPad = $innerWidth - $subtitle.Length; $sL = [Math]::Floor($sPad/2); $sR = $sPad - $sL
@@ -1731,7 +1731,7 @@ Write-Host ''
     # --- Simple ASCII banner for non-VT terminals (ISE, Server 2012 R2) ---
     Write-Host ''
     Write-Host '=================================================='
-    Write-Host '  WINDOWS NETWORK OPTIMIZER  v3.1-dev'
+    Write-Host '  WINDOWS NETWORK OPTIMIZER  v4.0'
     Write-Host '  universal - Win 7 SP1+ / 8.1 / 10 / 11'
     Write-Host '--------------------------------------------------'
     Write-Host ('  OS:           ' + $Global:WinInfo.Name)
@@ -1752,6 +1752,62 @@ if ($Restore) {
     Restore-FromBackup
     if (-not $Silent) { Read-Host 'Press Enter to exit' }
     return
+}
+
+# ============================================================
+#   INTERACTIVE MODE SELECTION (when not specified via -Mode)
+# ============================================================
+if (-not $PSBoundParameters.ContainsKey('Mode') -and -not $Silent) {
+    Write-Host ''
+    Write-Host '  ╭─────────────────────────────────────────────╮' -ForegroundColor Cyan
+    Write-Host '  │         OPTIMIZATION MODE SELECTION         │' -ForegroundColor White
+    Write-Host '  ╰─────────────────────────────────────────────╯' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  [1] THROUGHPUT   - max bandwidth     (downloads/streaming)' -ForegroundColor Green
+    Write-Host '                     autotuning=experimental, cubic, LSO/RSC ON'
+    Write-Host ''
+    Write-Host '  [2] LOW LATENCY  - min ping          (gaming/VoIP)' -ForegroundColor Magenta
+    Write-Host '                     Nagle OFF, ctcp, LSO/RSC OFF, MMCSS=0'
+    Write-Host ''
+    Write-Host '  [3] BALANCED     - compromise         (general use)' -ForegroundColor Yellow
+    Write-Host '                     adaptive interrupts, cubic, Nagle OFF'
+    Write-Host ''
+    Write-Host '  [4] FULL MAX     - throughput + telemetry OFF + Cloudflare DNS' -ForegroundColor Cyan
+    Write-Host '                     WARNING: disables Microsoft DiagTrack!'
+    Write-Host '                     WARNING: applies to ALL Ethernet adapters!'
+    Write-Host ''
+    Write-Host '  ─────────────────────────────────────────────' -ForegroundColor DarkGray
+    Write-Host ''
+    $modeChoice = Read-Host 'Choose mode [1-4] (default: 1=Throughput)'
+    if ([string]::IsNullOrWhiteSpace($modeChoice)) { $modeChoice = '1' }
+
+    switch ($modeChoice) {
+        '1' { $Mode = 'Throughput' }
+        '2' { $Mode = 'LowLatency' }
+        '3' { $Mode = 'Balanced' }
+        '4' {
+            $Mode = 'Throughput'
+            $DisableTelemetry = $true
+            $DnsProvider = 1
+            $All = $true
+            Write-Warn 'FULL MAX mode: Telemetry OFF + Cloudflare DNS + ALL Ethernet adapters'
+        }
+        default {
+            Write-Warn "Invalid choice '$modeChoice' — using default: Throughput"
+            $Mode = 'Throughput'
+        }
+    }
+
+    # Rebuild optimal settings for the selected mode
+    $OptimalSettings = Get-OptimalSettings -ModeName $Mode
+    Write-Host ''
+    Write-Info "Mode selected: $Mode"
+    Start-Sleep -Seconds 1
+    Clear-Host
+    Write-AsciiArt -Mode $Mode
+    Write-Host ''
+    # Re-display banner with updated mode (simplified re-display)
+    # The full banner was already shown above, just show updated mode
 }
 
 Show-Adapters

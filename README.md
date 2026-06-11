@@ -166,30 +166,25 @@ powershell -ExecutionPolicy Bypass -File $env:TEMP\opt.ps1
 ```mermaid
 flowchart LR
     User([User picks mode]):::user
-
     User --> T[Throughput<br/>Max bandwidth]:::tp
     User --> L[LowLatency<br/>Min ping]:::ll
     User --> B[Balanced<br/>Compromise]:::bal
-
     T --> T1[autotuning=experimental]
     T --> T2[CUBIC congestion]
     T --> T3[LSO/RSC ON]
     T --> T4[Adaptive interrupts]
     T --> T5[Nagle: default]
-
     L --> L1[autotuning=normal]
     L --> L2[CTCP congestion]
     L --> L3[LSO/RSC OFF]
     L --> L4[Interrupts OFF]
     L --> L5[Nagle: OFF]
     L --> L6[MMCSS=0]
-
     B --> B1[autotuning=normal]
     B --> B2[CUBIC congestion]
     B --> B3[LSO/RSC ON]
     B --> B4[Adaptive interrupts]
     B --> B5[Nagle: OFF]
-
     classDef user fill:#8B5CF6,stroke:#fff,color:#fff
     classDef tp fill:#22C55E,stroke:#fff,color:#fff
     classDef ll fill:#EC4899,stroke:#fff,color:#fff

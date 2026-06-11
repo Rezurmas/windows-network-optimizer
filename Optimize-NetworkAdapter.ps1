@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 #Requires -Version 5.0
 <#
 .SYNOPSIS
@@ -312,7 +312,7 @@ function Write-ProgressBar {
     $esc = [char]27
     $filled = [Math]::Floor($Percent / 100 * $Width)
     $empty = $Width - $filled
-    Write-Host -NoNewline "`r  $($esc)[38;2;$R;$G;${B}m$('█' * $filled)$($esc)[2m$('░' * $empty)$($esc)[0m $Percent%"
+    Write-Host -NoNewline "`r  $($esc)[38;2;$R;$G;${B}m$(([char]0x2588) * $filled)$($esc)[2m$(([char]0x2591) * $empty)$($esc)[0m $Percent%"
 }
 
 # ============================================================

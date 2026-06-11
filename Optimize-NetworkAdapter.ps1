@@ -1,4 +1,4 @@
-﻿#Requires -RunAsAdministrator
+﻿﻿#Requires -RunAsAdministrator
 #Requires -Version 5.0
 <#
 .SYNOPSIS
@@ -190,7 +190,7 @@ function Write-Spinner {
         [string]$Message,
         [int]$Duration = 2
     )
-    $frames = @('·', '✻', '✽', '✶', '✳', '✢')
+    $frames = @('·', '◈', '◆', '◇', '◖', '◗')  # Geometric Shapes block (U+25C6-U+25D7) — render in Consolas
     $esc    = [char]27
     $start  = Get-Date
     $i      = 0
@@ -412,11 +412,11 @@ $Global:DnsProviders = @(
     [PSCustomObject]@{ Id=11; Cat='AdBlock';  Name='AdGuard DNS (default)'; V4=@('94.140.14.14','94.140.15.15');       V6=@('2a10:50c0::ad1:ff','2a10:50c0::ad2:ff');       Desc='Most popular adblock DNS. Blocks ads + trackers in apps/games too.' }
     [PSCustomObject]@{ Id=12; Cat='AdBlock';  Name='AdGuard Family';        V4=@('94.140.14.15','94.140.15.16');       V6=@('2a10:50c0::bad1:ff','2a10:50c0::bad2:ff');     Desc='AdGuard + adult content block. Best for kid-safe + ad-free internet.' }
     [PSCustomObject]@{ Id=13; Cat='AdBlock';  Name='ControlD Free (ads)';   V4=@('76.76.2.0','76.76.10.0');            V6=@('2606:1a40::','2606:1a40:1::');                 Desc='ControlD with ad blocking. Free tier, paid for customization.' }
-    [PSCustomObject]@{ Id=14; Cat='AdBlock';  Name='Mullvad AdBlock';       V4=@('194.242.2.3','194.242.2.4');         V6=@('2a07:e340::3','2a07:e340::4');                 Desc='Mullvad VPN provider. Privacy-first + ads blocked.' }
+    [PSCustomObject]@{ Id=14; Cat='AdBlock';  Name='dns0.eu Zero';          V4=@('193.110.81.0','185.253.5.0');         V6=@('2a0f:fc80::','2a0f:fc81::');                   Desc='EU-based (France). Blocks malware+tracking. DNSSEC, no logs, GDPR compliant.' }
 
     # === PRIVACY (no logs, encryption-focused) ===
     [PSCustomObject]@{ Id=15; Cat='Privacy';  Name='AdGuard Unfiltered';    V4=@('94.140.14.140','94.140.14.141');     V6=@('2a10:50c0::1:ff','2a10:50c0::2:ff');           Desc='AdGuard infrastructure WITHOUT filtering. No logs.' }
-    [PSCustomObject]@{ Id=16; Cat='Privacy';  Name='Mullvad DNS';           V4=@('194.242.2.2','194.242.2.3');         V6=@('2a07:e340::2','2a07:e340::3');                 Desc='Sweden. Max privacy, no logs, no filtering, RAM-only.' }
+    [PSCustomObject]@{ Id=16; Cat='Privacy';  Name='dns0.eu Open';          V4=@('193.110.81.1','185.253.5.1');         V6=@('2a0f:fc80::1','2a0f:fc81::1');               Desc='EU-based (France). No filtering. DNSSEC, no logs, GDPR compliant.' }
 
     # === EU (European Union, GDPR-compliant) ===
     [PSCustomObject]@{ Id=17; Cat='EU';       Name='DNS4EU Protective';     V4=@('86.54.11.1','86.54.11.201');         V6=@('2a13:1001::86:54:11:1','2a13:1001::86:54:11:201'); Desc='EU-funded resolver (2025). GDPR, blocks malware/phishing.' }
@@ -1401,17 +1401,23 @@ function Restore-FromBackup {
     }
 
     Write-Info "Restoring to adapter: $adapterName"
+    $restoreCount = 0
     foreach ($p in $propsData) {
         try {
             Set-NetAdapterAdvancedProperty -Name $adapterName -DisplayName $p.DisplayName `
                 -DisplayValue $p.DisplayValue -NoRestart -ErrorAction Stop
             Write-Apply "$($p.DisplayName)  ->  $($p.DisplayValue)"
+            $restoreCount++
         } catch {
             Write-Warn "$($p.DisplayName): $($_.Exception.Message)"
         }
     }
     Restart-NetAdapter -Name $adapterName -ErrorAction SilentlyContinue
-    Write-OK 'Settings restored from backup. Adapter restarted.'
+    if ($restoreCount -gt 0) {
+        Write-OK "Settings restored from backup ($restoreCount properties). Adapter restarted."
+    } else {
+        Write-Warn 'No settings were restored. The adapter may not exist or backup may be for a different adapter.'
+    }
 }
 
 # ============================================================
@@ -1486,7 +1492,7 @@ $innerWidth = 50
 
 function Write-BannerLine { param($k, $v, $vc=$White)
     $vPad = 30
-    if ($v -isnot [string]) { $v = $v.ToString() }
+    if ($null -eq $v) { $v = '' } elseif ($v -isnot [string]) { $v = $v.ToString() }
     $vStr = if ($v.Length -gt $vPad) { $v.Substring(0, $vPad) } else { $v.PadRight($vPad) }
     Write-Host "$BoldBlue│$Reset  $DimGray$($k.PadRight(18))$Reset$vc$vStr$Reset$BoldBlue│$Reset"
 }
@@ -1644,10 +1650,10 @@ if (-not $NoRegistry) {
 # ============================================================
 #   PHASE 4: POWER MANAGEMENT (powercfg + Ultimate plan)
 # ============================================================
-Write-Spinner 'Applying powercfg deep power management...' 1
-Set-PowerCfgTweaks
 Write-Spinner 'Activating maximum performance power plan...' 1
 Set-PerformancePowerPlan
+Write-Spinner 'Applying powercfg deep power management...' 1
+Set-PowerCfgTweaks
 
 # ============================================================
 #   PHASE 5: TELEMETRY OFF (opt-in only)

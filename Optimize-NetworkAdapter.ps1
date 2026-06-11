@@ -149,7 +149,7 @@ function Write-Section {
     $side  = [char]0x2502                             # │
     Write-Host ''
     # Top border:   ╭────...────╮
-    Write-Host ('  ' + [char]0x256D + ([char]0x2500 * $inner) + [char]0x256E) -ForegroundColor Cyan
+    Write-Host ('  ' + [char]0x256D + ([string][char]0x2500 * $inner) + [char]0x256E) -ForegroundColor Cyan
     # Title:  │  centered-title  │  — bold white title on cyan borders
     $padTotal = $inner - 2 - $title.Length            # -2 for spaces between │ and text
     if ($padTotal -lt 0) { $padTotal = 0 }
@@ -161,7 +161,7 @@ function Write-Section {
     Write-Host (' ' * $rightPad + ' ') -NoNewline -ForegroundColor Cyan
     Write-Host $side -ForegroundColor Cyan
     # Bottom border:   ╰────...────╯
-    Write-Host ('  ' + [char]0x2570 + ([char]0x2500 * $inner) + [char]0x256F) -ForegroundColor Cyan
+    Write-Host ('  ' + [char]0x2570 + ([string][char]0x2500 * $inner) + [char]0x256F) -ForegroundColor Cyan
 }
 
 # Sub-header inside a section — dimmed line with bold white title
@@ -170,15 +170,15 @@ function Write-SubSection {
     param([string]$title)
     Write-Host ''
     Write-Host '  ' -NoNewline
-    Write-Host ([char]0x2500 * 4) -NoNewline -ForegroundColor DarkGray
+    Write-Host ([string][char]0x2500 * 4) -NoNewline -ForegroundColor DarkGray
     Write-Host " $title " -NoNewline -ForegroundColor White
-    Write-Host ([char]0x2500 * 4) -ForegroundColor DarkGray
+    Write-Host ([string][char]0x2500 * 4) -ForegroundColor DarkGray
 }
 
 # Thin dimmed divider line — separates sub-sections without fanfare
 #   ─────────────────────────────────────────────────
 function Write-MiniDivider {
-    Write-Host ('  ' + [char]0x2500 * 54) -ForegroundColor DarkGray
+    Write-Host ('  ' + [string][char]0x2500 * 54) -ForegroundColor DarkGray
 }
 
 # Spinner animation — shows a rotating symbol for a given duration.
@@ -312,7 +312,7 @@ function Write-ProgressBar {
     $esc = [char]27
     $filled = [Math]::Floor($Percent / 100 * $Width)
     $empty = $Width - $filled
-    Write-Host -NoNewline "`r  $($esc)[38;2;$R;$G;${B}m$(([char]0x2588) * $filled)$($esc)[2m$(([char]0x2591) * $empty)$($esc)[0m $Percent%"
+    Write-Host -NoNewline "`r  $($esc)[38;2;$R;$G;${B}m$(([string][char]0x2588) * $filled)$($esc)[2m$(([string][char]0x2591) * $empty)$($esc)[0m $Percent%"
 }
 
 # ============================================================
@@ -325,17 +325,17 @@ function Get-WindowsInfo {
 
     # Windows version detection (BuildNumber based)
     $name = switch ($build) {
-        { $_ -ge 22000 } { 'Windows 11' }
-        { $_ -ge 10240 } { 'Windows 10' }
-        { $_ -ge 9600  } { 'Windows 8.1 / Server 2012 R2' }
-        { $_ -ge 9200  } { 'Windows 8 / Server 2012' }
-        { $_ -ge 7601  } { 'Windows 7 SP1 / Server 2008 R2' }
+        { $_ -ge 22000 } { 'Windows 11'; break }
+        { $_ -ge 10240 } { 'Windows 10'; break }
+        { $_ -ge 9600  } { 'Windows 8.1 / Server 2012 R2'; break }
+        { $_ -ge 9200  } { 'Windows 8 / Server 2012'; break }
+        { $_ -ge 7601  } { 'Windows 7 SP1 / Server 2008 R2'; break }
         default          { "Unknown ($build)" }
     }
 
     return [PSCustomObject]@{
-        Name               = $name
-        Version            = $os.Version
+        Name               = [string]$name
+        Version            = [string]$os.Version
         BuildNumber        = $build
         PSVersion          = $PSVersionTable.PSVersion.ToString()
         SupportsNetAdapter = ($build -ge 9600)   # Win 8.1+ required for Get-NetAdapter
@@ -1493,7 +1493,7 @@ function Write-BannerLine { param($k, $v, $vc=$White)
 
 Write-Host ''
 # -- Top box: title + subtitle --
-$title    = 'WINDOWS NETWORK OPTIMIZER  v3.0'
+$title    = 'WINDOWS NETWORK OPTIMIZER  v3.1-dev'
 $subtitle = 'universal · Win 7 SP1+ / 8.1 / 10 / 11'
 $tPad = $innerWidth - $title.Length;    $tL = [Math]::Floor($tPad/2); $tR = $tPad - $tL
 $sPad = $innerWidth - $subtitle.Length; $sL = [Math]::Floor($sPad/2); $sR = $sPad - $sL

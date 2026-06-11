@@ -196,12 +196,12 @@ function Write-Spinner {
     $i      = 0
     while (((Get-Date) - $start).TotalSeconds -lt $Duration) {
         $frame = $frames[$i % $frames.Count]
-        Write-Host ("`r$esc[2K  $frame  $Message") -NoNewline -ForegroundColor Cyan
+        Write-Host ("`r$($esc)[2K  $frame  $Message") -NoNewline -ForegroundColor Cyan
         Start-Sleep -Milliseconds 80
         $i++
     }
     # Clear the spinner line so subsequent output appears cleanly
-    Write-Host "`r$esc[2K" -NoNewline
+    Write-Host "`r$($esc)[2K" -NoNewline
 }
 
 # Pulsing dot animation — shows growing/shrinking dots during slow operations.
@@ -219,7 +219,7 @@ function Write-PulseDot {
         2 { '· · ·' }
         3 { '· ·' }
     }
-    Write-Host ("`r$esc[2K  ◌  $Label $dots") -NoNewline -ForegroundColor DarkGray
+    Write-Host ("`r$($esc)[2K  ◌  $Label $dots") -NoNewline -ForegroundColor DarkGray
 }
 
 # ● green  = success (replaces [ OK ])
@@ -297,12 +297,12 @@ function Write-GradientText {
         $r = [Math]::Round($R1 + ($R2 - $R1) * $t)
         $g = [Math]::Round($G1 + ($G2 - $G1) * $t)
         $b = [Math]::Round($B1 + ($B2 - $B1) * $t)
-        Write-Host -NoNewline "$esc[38;2;$r;$g;${b}m$($Text[$i])"
+        Write-Host -NoNewline "$($esc)[38;2;$r;$g;${b}m$($Text[$i])"
     }
     if ($NoNewline) {
-        Write-Host -NoNewline "$esc[0m"
+        Write-Host -NoNewline "$($esc)[0m"
     } else {
-        Write-Host "$esc[0m"
+        Write-Host "$($esc)[0m"
     }
 }
 
@@ -312,7 +312,7 @@ function Write-ProgressBar {
     $esc = [char]27
     $filled = [Math]::Floor($Percent / 100 * $Width)
     $empty = $Width - $filled
-    Write-Host -NoNewline "`r  $esc[38;2;$R;$G;${B}m$('█' * $filled)$esc[2m$('░' * $empty)$esc[0m $Percent%"
+    Write-Host -NoNewline "`r  $($esc)[38;2;$R;$G;${B}m$('█' * $filled)$($esc)[2m$('░' * $empty)$($esc)[0m $Percent%"
 }
 
 # ============================================================
@@ -1471,16 +1471,16 @@ Write-Host ''
 
 # --- Claude Code style ANSI truecolor banner ---
 $esc = [char]27
-$BoldBlue    = "$esc[1;38;2;59;130;246m"
-$BoldWhite   = "$esc[1;37m"
-$Orange      = "$esc[1;38;2;217;119;6m"
-$Gold        = "$esc[38;2;245;158;11m"
-$DimGray     = "$esc[2;37m"
-$White       = "$esc[37m"
-$Green       = "$esc[1;32m"
-$Magenta     = "$esc[1;35m"
-$Yellow      = "$esc[1;33m"
-$Reset       = "$esc[0m"
+$BoldBlue    = "$($esc)[1;38;2;59;130;246m"
+$BoldWhite   = "$($esc)[1;37m"
+$Orange      = "$($esc)[1;38;2;217;119;6m"
+$Gold        = "$($esc)[38;2;245;158;11m"
+$DimGray     = "$($esc)[2;37m"
+$White       = "$($esc)[37m"
+$Green       = "$($esc)[1;32m"
+$Magenta     = "$($esc)[1;35m"
+$Yellow      = "$($esc)[1;33m"
+$Reset       = "$($esc)[0m"
 
 $innerWidth = 50
 

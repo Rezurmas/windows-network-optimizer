@@ -1,4 +1,4 @@
-﻿﻿#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 #Requires -Version 5.0
 <#
 .SYNOPSIS
@@ -126,10 +126,22 @@ param(
     [switch]$Silent
 )
 
+# --- Virtual Terminal (VT) / ANSI escape sequence detection ---
+# PowerShell ISE output pane and older consoles (Server 2012 R2) do NOT support
+# ANSI escape codes. We detect this early and fall back to plain-text output.
+$SupportsVT = $false
+try {
+    $SupportsVT = $host.UI.SupportsVirtualTerminal
+} catch { }
+# Also detect PowerShell ISE (output pane is NOT a terminal)
+$IsISE = $host.Name -match 'ISE'
+if ($IsISE) { $SupportsVT = $false }
+
 # 'Continue' is used instead of 'Stop' so the script can apply as many
 # optimizations as possible — a single failed setting (e.g. unsupported
 # by a specific NIC vendor) should not abort the entire optimization run.
 $ErrorActionPreference = 'Continue'
+$ScriptStartErrorCount = $Error.Count
 $BackupDir = Join-Path $env:USERPROFILE 'Desktop\NIC-Backup'
 
 # ============================================================
@@ -190,6 +202,13 @@ function Write-Spinner {
         [string]$Message,
         [int]$Duration = 2
     )
+
+    if (-not $SupportsVT) {
+        Write-Host "  ... $Message" -ForegroundColor Cyan
+        Start-Sleep -Seconds $Duration
+        return
+    }
+
     $frames = @('·', '◈', '◆', '◇', '◖', '◗')  # Geometric Shapes block (U+25C6-U+25D7) — render in Consolas
     $esc    = [char]27
     $start  = Get-Date
@@ -211,6 +230,12 @@ function Write-PulseDot {
         [string]$Label,
         [int]$Step
     )
+
+    if (-not $SupportsVT) {
+        Write-Host "  . $Label step $Step" -ForegroundColor DarkGray
+        return
+    }
+
     $esc     = [char]27
     $pattern = $Step % 4
     $dots    = switch ($pattern) {
@@ -291,6 +316,13 @@ function Write-GradientText {
     param([string]$Text, [int]$R1=217, [int]$G1=119, [int]$B1=6,
           [int]$R2=245, [int]$G2=158, [int]$B2=11,
           [switch]$NoNewline)
+
+    if (-not $SupportsVT) {
+        # Fall back to plain text for non-VT terminals (ISE, Server 2012 R2)
+        if ($NoNewline) { Write-Host $Text -NoNewline } else { Write-Host $Text }
+        return
+    }
+
     $esc = [char]27
     for ($i = 0; $i -lt $Text.Length; $i++) {
         $t = if ($Text.Length -gt 1) { $i / ($Text.Length - 1) } else { 0 }
@@ -309,6 +341,12 @@ function Write-GradientText {
 # Progress bar for multi-adapter optimization loop
 function Write-ProgressBar {
     param([int]$Percent, [int]$Width=40, [int]$R=217, [int]$G=119, [int]$B=6)
+
+    if (-not $SupportsVT) {
+        Write-Host -NoNewline "`r  [Progress: $Percent%]"
+        return
+    }
+
     $esc = [char]27
     $filled = [Math]::Floor($Percent / 100 * $Width)
     $empty = $Width - $filled
@@ -375,6 +413,53 @@ if ($Global:WinInfo.BuildNumber -lt 9600) {
         if (-not $Silent) { Read-Host 'Press Enter to exit' }
         return
     }
+}
+
+# ============================================================
+#   32-BIT POWERSHELL ON 64-BIT WINDOWS DETECTION
+#
+#   CRITICAL: On 32-bit PowerShell, registry writes to
+#   HKLM:\SOFTWARE are redirected by WOW64 to:
+#   HKLM:\SOFTWARE\WOW6432Node\...
+#
+#   This means MMCSS and DeliveryOptimization registry tweaks
+#   go to the WRONG hive and never take effect. We detect this
+#   condition and either:
+#     (a) warn the user and skip those sections, or
+#     (b) in Silent mode, skip automatically.
+#
+#   The .bat launcher always uses 64-bit PowerShell from
+#   System32, so this only triggers if someone runs 32-bit PS
+#   manually (e.g. from SysWOW64 or 32-bit ISE).
+# ============================================================
+$Is32on64 = [Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess
+if ($Is32on64) {
+    Write-Host ''
+    Write-Warn '═══════════════════════════════════════════════════════════'
+    Write-Warn '  32-bit PowerShell detected on 64-bit Windows!'
+    Write-Warn '  Registry SOFTWARE writes ARE redirected to WOW6432Node.'
+    Write-Warn '  MMCSS and DeliveryOptimization registry tweaks will be'
+    Write-Warn '  SKIPPED because they would write to the WRONG hive.'
+    Write-Warn '═══════════════════════════════════════════════════════════'
+    Write-Warn '  FIX: Run the 64-bit version of PowerShell.'
+    Write-Warn '       → Path: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    Write-Warn '       → NOT:  C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe'
+    Write-Info '  The .bat launcher (Run-NIC-Optimizer.bat) uses the correct'
+    Write-Info '  64-bit PowerShell automatically via the System32 path.'
+    Write-Host ''
+    if (-not $Silent) {
+        $cont = Read-Host 'Continue anyway? Registry SOFTWARE tweaks will be skipped (Y/N)'
+        if ($cont -notmatch '^[YyTt]') {
+            Write-Err 'Aborted by user. Please re-run with 64-bit PowerShell.'
+            return
+        }
+    }
+    # Set skip flags for MMCSS and DeliveryOptimization when on 32-bit
+    $SkipMMCSS      = $true
+    $SkipDeliveryOpt = $true
+} else {
+    $SkipMMCSS      = $false
+    $SkipDeliveryOpt = $false
 }
 
 # ============================================================
@@ -614,77 +699,113 @@ function Get-OptimalSettings {
         # === LINK NEGOTIATION ===
         # Critical: forces 1Gbps full-duplex auto-negotiation.
         # Common cause of stuck-at-100Mbps issues.
-        @{ Pattern = '^Speed.+Duplex$|^Szybkosc.+Dupleks$|^Speed/Duplex$';  Value = 'Auto Negotiation' }
-        @{ Pattern = '^Auto Negotiation$';                                  Value = 'Enabled' }
-        @{ Pattern = 'Wait for Link';                                       Value = 'On' }
+        @{ Pattern = '^Speed.+Duplex$|^Szybkosc.+Dupleks$|^Speed/Duplex$';  Value = 'Auto Negotiation';
+           Keyword = '\*SpeedDuplex|\*LinkSpeed' }
+        @{ Pattern = '^Auto Negotiation$';                                  Value = 'Enabled';
+           Keyword = '\*AutoNegotiation' }
+        @{ Pattern = 'Wait for Link';                                       Value = 'On';
+           Keyword = '\*WaitForLink' }
 
         # === FLOW CONTROL & RSS (Receive Side Scaling) ===
         # Flow Control: pause frames prevent buffer overflow.
         # RSS: distributes incoming packets across multiple CPU cores.
-        @{ Pattern = '^Flow Control$|Sterowanie przeplywem$';                Value = 'Rx & Tx Enabled' }
-        @{ Pattern = 'Receive Side Scaling$|^RSS$';                         Value = 'Enabled' }
-        @{ Pattern = 'Maximum Number of RSS Queues|RSS Queues';             Value = '4 Queues' }
-        @{ Pattern = 'NetworkDirect|RDMA';                                  Value = 'Enabled' }
+        @{ Pattern = '^Flow Control$|Sterowanie przeplywem$';                Value = 'Rx & Tx Enabled';
+           Keyword = '\*FlowControl' }
+        @{ Pattern = 'Receive Side Scaling$|^RSS$';                         Value = 'Enabled';
+           Keyword = '\*RSS$' }
+        @{ Pattern = 'Maximum Number of RSS Queues|RSS Queues';             Value = '4 Queues';
+           Keyword = '\*NumRSSQueues|\*RSSQueues' }
+        @{ Pattern = 'NetworkDirect|RDMA';                                  Value = 'Enabled';
+           Keyword = '\*NetworkDirect|\*Rdma|\*NdisRdma' }
 
         # === BUFFERS (max throughput) ===
         # Bigger buffers = less packet drop under load (downloads, streaming).
-        @{ Pattern = 'Receive Buffers|Bufory odbioru';                      Value = '2048' }
-        @{ Pattern = 'Transmit Buffers|Bufory wysylania|Send Buffers';      Value = '2048' }
+        @{ Pattern = 'Receive Buffers|Bufory odbioru';                      Value = '2048';
+           Keyword = '\*ReceiveBuffers' }
+        @{ Pattern = 'Transmit Buffers|Bufory wysylania|Send Buffers';      Value = '2048';
+           Keyword = '\*TransmitBuffers' }
 
         # === CHECKSUM OFFLOADS (CPU -> NIC) ===
         # Hardware computes checksums instead of CPU. Less CPU usage.
-        @{ Pattern = 'TCP Checksum Offload \(IPv4\)';                       Value = 'Rx & Tx Enabled' }
-        @{ Pattern = 'TCP Checksum Offload \(IPv6\)';                       Value = 'Rx & Tx Enabled' }
-        @{ Pattern = 'UDP Checksum Offload \(IPv4\)';                       Value = 'Rx & Tx Enabled' }
-        @{ Pattern = 'UDP Checksum Offload \(IPv6\)';                       Value = 'Rx & Tx Enabled' }
-        @{ Pattern = 'IPv4 Checksum Offload';                               Value = 'Rx & Tx Enabled' }
-        @{ Pattern = 'ARP Offload';                                         Value = 'Enabled' }
-        @{ Pattern = 'NS Offload';                                          Value = 'Enabled' }
+        @{ Pattern = 'TCP Checksum Offload \(IPv4\)';                       Value = 'Rx & Tx Enabled';
+           Keyword = '\*TCPChecksumOffloadIPv4|\*TCPUDPChecksumOffloadIPv4' }
+        @{ Pattern = 'TCP Checksum Offload \(IPv6\)';                       Value = 'Rx & Tx Enabled';
+           Keyword = '\*TCPChecksumOffloadIPv6|\*TCPUDPChecksumOffloadIPv6' }
+        @{ Pattern = 'UDP Checksum Offload \(IPv4\)';                       Value = 'Rx & Tx Enabled';
+           Keyword = '\*UDPChecksumOffloadIPv4|\*TCPUDPChecksumOffloadIPv4' }
+        @{ Pattern = 'UDP Checksum Offload \(IPv6\)';                       Value = 'Rx & Tx Enabled';
+           Keyword = '\*UDPChecksumOffloadIPv6|\*TCPUDPChecksumOffloadIPv6' }
+        @{ Pattern = 'IPv4 Checksum Offload';                               Value = 'Rx & Tx Enabled';
+           Keyword = '\*IPChecksumOffloadIPv4' }
+        @{ Pattern = 'ARP Offload';                                         Value = 'Enabled';
+           Keyword = '\*ArpOffload' }
+        @{ Pattern = 'NS Offload';                                          Value = 'Enabled';
+           Keyword = '\*NSOffload' }
 
         # === JUMBO FRAMES ===
         # Disabled by default - most home routers/ISPs use 1500 MTU.
         # Enable only if your entire network supports 9000 MTU end-to-end.
-        @{ Pattern = 'Jumbo (Packet|Frame)';                                Value = 'Disabled' }
-        @{ Pattern = 'Packet Priority.+VLAN|Priority.+VLAN';                Value = 'Packet Priority & VLAN Enabled' }
+        @{ Pattern = 'Jumbo (Packet|Frame)';                                Value = 'Disabled';
+           Keyword = '\*JumboPacket' }
+        @{ Pattern = 'Packet Priority.+VLAN|Priority.+VLAN';                Value = 'Packet Priority & VLAN Enabled';
+           Keyword = '\*PriorityVLANTag' }
 
         # === DISABLE POWER SAVING (main cause of speed drops!) ===
         # EEE/Green Ethernet downgrades link to save power -> bandwidth drops.
         # Disabling these is critical for stable gigabit speed.
-        @{ Pattern = 'Energy.Efficient Ethernet|^EEE$';                     Value = 'Disabled' }
-        @{ Pattern = 'Advanced EEE';                                        Value = 'Disabled' }
-        @{ Pattern = 'Green Ethernet';                                      Value = 'Disabled' }
-        @{ Pattern = 'Power Saving Mode|Power Save';                        Value = 'Disabled' }
-        @{ Pattern = 'Ultra Low Power';                                     Value = 'Disabled' }
-        @{ Pattern = 'Gigabit Lite';                                        Value = 'Disabled' }
-        @{ Pattern = 'Auto Disable Gigabit';                                Value = 'Disabled' }
-        @{ Pattern = 'Selective Suspend';                                   Value = 'Disabled' }
-        @{ Pattern = 'System Idle Power Saver';                             Value = 'Disabled' }
-        @{ Pattern = 'Reduce Speed On Power Down';                          Value = 'Disabled' }
-        @{ Pattern = 'Power Down PHY|Shutdown Wake\.On\.Lan';                 Value = 'Disabled' }
+        @{ Pattern = 'Energy.Efficient Ethernet|^EEE$';                     Value = 'Disabled';
+           Keyword = '\*EEEControl|\*EEE$' }
+        @{ Pattern = 'Advanced EEE';                                        Value = 'Disabled';
+           Keyword = '\*AdvancedEEE' }
+        @{ Pattern = 'Green Ethernet';                                      Value = 'Disabled';
+           Keyword = '\*GreenEthernet' }
+        @{ Pattern = 'Power Saving Mode|Power Save';                        Value = 'Disabled';
+           Keyword = '\*PowerSavingMode' }
+        @{ Pattern = 'Ultra Low Power';                                     Value = 'Disabled';
+           Keyword = '\*UltraLowPower' }
+        @{ Pattern = 'Gigabit Lite';                                        Value = 'Disabled';
+           Keyword = '\*GigabitLite' }
+        @{ Pattern = 'Auto Disable Gigabit';                                Value = 'Disabled';
+           Keyword = '\*AutoDisableGigabit' }
+        @{ Pattern = 'Selective Suspend';                                   Value = 'Disabled';
+           Keyword = '\*SelectiveSuspend' }
+        @{ Pattern = 'System Idle Power Saver';                             Value = 'Disabled';
+           Keyword = '\*SystemIdlePowerSaver' }
+        @{ Pattern = 'Reduce Speed On Power Down';                          Value = 'Disabled';
+           Keyword = '\*ReduceSpeedOnPowerDown' }
+        @{ Pattern = 'Power Down PHY|Shutdown Wake\.On\.Lan';                 Value = 'Disabled';
+           Keyword = '\*PowerDownPHY|\*ShutdownWakeOnLan' }
 
         # === VENDOR-SPECIFIC POWER SAVING FEATURES (always disable) ===
         # Realtek: Idle power saving drops link speed when idle -> disable
-        @{ Pattern = 'Idle Power Saving';                                      Value = 'Disabled' }
+        @{ Pattern = 'Idle Power Saving';                                      Value = 'Disabled';
+           Keyword = '\*IdlePowerSaving' }
         # Realtek: Auto-disable PCIe link can cause reconnect delays
-        @{ Pattern = 'Auto Disable PCIe|Auto Disable PCI Express';             Value = 'Disabled' }
+        @{ Pattern = 'Auto Disable PCIe|Auto Disable PCI Express';             Value = 'Disabled';
+           Keyword = '\*AutoDisablePCIe|\*AutoDisablePcie' }
 
         # === KILLER NETWORKING "GAMING" FEATURES (disable — cause lag) ===
         # Killer Advanced Stream Detect = QoS-like packet prioritization that
         # often prioritizes the wrong traffic, causing jitter and bufferbloat.
-        @{ Pattern = 'Advanced Stream Detect';                                 Value = 'Disabled' }
+        @{ Pattern = 'Advanced Stream Detect';                                 Value = 'Disabled';
+           Keyword = '\*AdvancedStreamDetect' }
         # Killer GameFast = proprietary fast-path that interferes with Windows
         # native TCP stack optimizations. Safer off.
-        @{ Pattern = 'GameFast';                                               Value = 'Disabled' }
+        @{ Pattern = 'GameFast';                                               Value = 'Disabled';
+           Keyword = '\*GameFast' }
 
         # === BROADCOM / INTEL SERVER NIC VIRTUALIZATION ===
         # VMQ = Virtual Machine Queues — distributes VM traffic across cores
-        @{ Pattern = 'Virtualization|VMQ|Virtual Machine Queues';              Value = 'Enabled' }
+        @{ Pattern = 'Virtualization|VMQ|Virtual Machine Queues';              Value = 'Enabled';
+           Keyword = '\*VMQ|\*Vmq' }
         # SR-IOV = Single Root I/O Virtualization — direct NIC access for VMs
-        @{ Pattern = 'SR-IOV';                                                 Value = 'Enabled' }
+        @{ Pattern = 'SR-IOV';                                                 Value = 'Enabled';
+           Keyword = '\*SRIOV|\*Sriov' }
 
         # === INTEL GIGABIT MASTER/SLAVE MODE ===
         # Auto Detect is safest — lets NIC negotiate role with switch
-        @{ Pattern = 'Gigabit Master Slave Mode';                              Value = 'Auto Detect' }
+        @{ Pattern = 'Gigabit Master Slave Mode';                              Value = 'Auto Detect';
+           Keyword = '\*GigabitMasterSlaveMode' }
     )
 
     # === MODE-SPECIFIC SETTINGS ===
@@ -693,47 +814,77 @@ function Get-OptimalSettings {
         # LSO = Large Send Offload (CPU sends large segment, NIC chunks it)
         # RSC = Receive Segment Coalescing (NIC merges packets before CPU)
         $base += @(
-            @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Enabled' }
-            @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Enabled' }
-            @{ Pattern = 'Recv Segment Coalescing \(IPv4\)';                Value = 'Enabled' }
-            @{ Pattern = 'Recv Segment Coalescing \(IPv6\)';                Value = 'Enabled' }
-            @{ Pattern = '^Interrupt Moderation$';                          Value = 'Enabled' }
-            @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Adaptive' }
-            @{ Pattern = 'Adaptive Inter.Frame Spacing';                    Value = 'Disabled' }
-            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Enabled' }
-            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Adaptive' }
-            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Enabled' }
+            @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Enabled';
+               Keyword = '\*LsoV2IPv4' }
+            @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Enabled';
+               Keyword = '\*LsoV2IPv6' }
+            @{ Pattern = 'Recv Segment Coalescing \(IPv4\)';                Value = 'Enabled';
+               Keyword = '\*RscIPv4' }
+            @{ Pattern = 'Recv Segment Coalescing \(IPv6\)';                Value = 'Enabled';
+               Keyword = '\*RscIPv6' }
+            @{ Pattern = '^Interrupt Moderation$';                          Value = 'Enabled';
+               Keyword = '\*InterruptModeration$' }
+            @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Adaptive';
+               Keyword = '\*InterruptModerationRate' }
+            @{ Pattern = 'Adaptive Inter.Frame Spacing';                    Value = 'Disabled';
+               Keyword = '\*AdaptiveIFS' }
+            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Enabled';
+               Keyword = '\*InterruptModerationMode' }
+            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Adaptive';
+               Keyword = '\*ITR' }
+            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Enabled';
+               Keyword = '\*AdaptiveInterruptModeration' }
         )
     }
     elseif ($ModeName -eq 'LowLatency') {
         # Gaming/VoIP: LSO/RSC OFF (they batch packets -> add latency).
         # Interrupt Moderation OFF (process every packet immediately).
         $base += @(
-            @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Disabled' }
-            @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Disabled' }
-            @{ Pattern = 'Recv Segment Coalescing \(IPv4\)';                Value = 'Disabled' }
-            @{ Pattern = 'Recv Segment Coalescing \(IPv6\)';                Value = 'Disabled' }
-            @{ Pattern = '^Interrupt Moderation$';                          Value = 'Disabled' }
-            @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Off' }
-            @{ Pattern = 'Adaptive Inter.Frame Spacing';                    Value = 'Disabled' }
-            @{ Pattern = 'Priority.+VLAN.+Tag';                             Value = 'Priority Enabled' }
-            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Disabled' }
-            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Off' }
-            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Disabled' }
+            @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Disabled';
+               Keyword = '\*LsoV2IPv4' }
+            @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Disabled';
+               Keyword = '\*LsoV2IPv6' }
+            @{ Pattern = 'Recv Segment Coalescing \(IPv4\)';                Value = 'Disabled';
+               Keyword = '\*RscIPv4' }
+            @{ Pattern = 'Recv Segment Coalescing \(IPv6\)';                Value = 'Disabled';
+               Keyword = '\*RscIPv6' }
+            @{ Pattern = '^Interrupt Moderation$';                          Value = 'Disabled';
+               Keyword = '\*InterruptModeration$' }
+            @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Off';
+               Keyword = '\*InterruptModerationRate' }
+            @{ Pattern = 'Adaptive Inter.Frame Spacing';                    Value = 'Disabled';
+               Keyword = '\*AdaptiveIFS' }
+            @{ Pattern = 'Priority.+VLAN.+Tag';                             Value = 'Priority Enabled';
+               Keyword = '\*PriorityVLANTag' }
+            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Disabled';
+               Keyword = '\*InterruptModerationMode' }
+            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Off';
+               Keyword = '\*ITR' }
+            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Disabled';
+               Keyword = '\*AdaptiveInterruptModeration' }
         )
     }
     else {
         # Balanced: keep offloads but adaptive timing.
         $base += @(
-            @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Enabled' }
-            @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Enabled' }
-            @{ Pattern = 'Recv Segment Coalescing \(IPv4\)';                Value = 'Enabled' }
-            @{ Pattern = 'Recv Segment Coalescing \(IPv6\)';                Value = 'Enabled' }
-            @{ Pattern = '^Interrupt Moderation$';                          Value = 'Enabled' }
-            @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Adaptive' }
-            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Enabled' }
-            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Adaptive' }
-            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Enabled' }
+            @{ Pattern = 'Large Send Offload V2 \(IPv4\)';                  Value = 'Enabled';
+               Keyword = '\*LsoV2IPv4' }
+            @{ Pattern = 'Large Send Offload V2 \(IPv6\)';                  Value = 'Enabled';
+               Keyword = '\*LsoV2IPv6' }
+            @{ Pattern = 'Recv Segment Coalescing \(IPv4\)';                Value = 'Enabled';
+               Keyword = '\*RscIPv4' }
+            @{ Pattern = 'Recv Segment Coalescing \(IPv6\)';                Value = 'Enabled';
+               Keyword = '\*RscIPv6' }
+            @{ Pattern = '^Interrupt Moderation$';                          Value = 'Enabled';
+               Keyword = '\*InterruptModeration$' }
+            @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Adaptive';
+               Keyword = '\*InterruptModerationRate' }
+            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Enabled';
+               Keyword = '\*InterruptModerationMode' }
+            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Adaptive';
+               Keyword = '\*ITR' }
+            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Enabled';
+               Keyword = '\*AdaptiveInterruptModeration' }
         )
     }
 
@@ -818,7 +969,13 @@ function Optimize-Adapter {
         if ([string]::IsNullOrWhiteSpace($displayName)) { continue }
 
         # Find a matching optimal setting from $OptimalSettings table
+        # First try DisplayName match (works on English/Polish Windows)
         $match = $OptimalSettings | Where-Object { $displayName -match $_.Pattern } | Select-Object -First 1
+        # Fallback: if DisplayName didn't match, try RegistryKeyword (always English)
+        # This makes the script work on ANY Windows language: French, German, Chinese, etc.
+        if (-not $match -and $prop.RegistryKeyword) {
+            $match = $OptimalSettings | Where-Object { $_.Keyword -and $prop.RegistryKeyword -match $_.Keyword } | Select-Object -First 1
+        }
         if (-not $match) {
             $skipped++
             continue
@@ -865,6 +1022,13 @@ function Optimize-Adapter {
     Write-Host '    Already OK: ' -NoNewline; Write-Host $alreadyOk -ForegroundColor White
     Write-Host '    Skipped:    ' -NoNewline; Write-Host $skipped   -ForegroundColor DarkGray
     Write-Host '    Failed:     ' -NoNewline; Write-Host $failed    -ForegroundColor Yellow
+
+    # Warn if we suspect the system is running a non-English Windows locale
+    # where DisplayName matching failed but RegistryKeyword fallback succeeded
+    if (($applied + $alreadyOk) -gt 0 -and $skipped -gt 10) {
+        Write-Host '    Note: RegistryKeyword fallback was used — '
+        Write-Host '    your Windows may be using a non-English display language.' -ForegroundColor DarkCyan
+    }
 
     # Restart adapter once at end (so all changes apply together with one drop)
     if ($applied -gt 0) {
@@ -984,7 +1148,21 @@ function Optimize-TcpIpGlobal {
         # Run it manually only if you have specific connection issues.
     )
 
+    # Skip deprecated netsh commands on newer Windows
+    $skipChimney = $Global:WinInfo.BuildNumber -ge 17763  # Win 10 1809+ / Server 2019+
+    $skipNetDma  = $Global:WinInfo.BuildNumber -ge 14393  # Win 10 1607+ / Server 2016+
+
     foreach ($cmd in $cmds) {
+        # Skip deprecated chimney command on Win 10 1809+ / Server 2019+
+        if ($skipChimney -and $cmd.c -match 'chimney') {
+            Write-Skip $cmd.desc
+            continue
+        }
+        # Skip deprecated netdma command on Win 10 1607+ / Server 2016+
+        if ($skipNetDma -and $cmd.c -match 'netdma') {
+            Write-Skip $cmd.desc
+            continue
+        }
         try {
             $out = cmd.exe /c $cmd.c 2>&1
             if ($LASTEXITCODE -eq 0 -or $out -match 'OK|Ok') {
@@ -1144,12 +1322,18 @@ function Set-MmcssOptimization {
         }
     }
 
-    foreach ($t in $tweaks) {
-        try {
-            Set-ItemProperty -Path $t.Path -Name $t.Name -Value $t.Value -Type $t.Type -Force -ErrorAction Stop
-            Write-Apply $t.Desc
-        } catch {
-            Write-Warn "$($t.Name): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+    if ($SkipMMCSS) {
+        Write-Warn '⚠ MMCSS registry writes SKIPPED (32-bit PS on 64-bit OS: would go to WOW6432Node)'
+        Write-Info '  Run the 64-bit version of PowerShell to apply MMCSS tweaks.'
+        Write-Info '  Path: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    } else {
+        foreach ($t in $tweaks) {
+            try {
+                Set-ItemProperty -Path $t.Path -Name $t.Name -Value $t.Value -Type $t.Type -Force -ErrorAction Stop
+                Write-Apply $t.Desc
+            } catch {
+                Write-Warn "$($t.Name): $($_.Exception.Message.Split([Environment]::NewLine)[0])"
+            }
         }
     }
 }
@@ -1246,13 +1430,19 @@ function Disable-TelemetryServices {
     }
 
     # Disable Delivery Optimization - P2P Windows Update upload (major bandwidth eater)
-    try {
-        $doPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'
-        if (-not (Test-Path $doPath)) { New-Item -Path $doPath -Force | Out-Null }
-        Set-ItemProperty -Path $doPath -Name 'DODownloadMode' -Value 0 -Type DWord -Force
-        Write-Apply 'Delivery Optimization = OFF  [no P2P upload of Windows Updates to other PCs]'
-    } catch {
-        Write-Warn "Delivery Optimization: $($_.Exception.Message)"
+    if ($SkipDeliveryOpt) {
+        Write-Warn '⚠ DeliveryOptimization registry write SKIPPED (32-bit PS on 64-bit OS: would go to WOW6432Node)'
+        Write-Info '  Run the 64-bit version of PowerShell to disable Delivery Optimization.'
+        Write-Info '  Path: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    } else {
+        try {
+            $doPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'
+            if (-not (Test-Path $doPath)) { New-Item -Path $doPath -Force | Out-Null }
+            Set-ItemProperty -Path $doPath -Name 'DODownloadMode' -Value 0 -Type DWord -Force
+            Write-Apply 'Delivery Optimization = OFF  [no P2P upload of Windows Updates to other PCs]'
+        } catch {
+            Write-Warn "Delivery Optimization: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -1476,6 +1666,7 @@ Write-AsciiArt -Mode $Mode
 Write-Host ''
 
 # --- Claude Code style ANSI truecolor banner ---
+if ($SupportsVT) {
 $esc = [char]27
 $BoldBlue    = "$($esc)[1;38;2;59;130;246m"
 $BoldWhite   = "$($esc)[1;37m"
@@ -1515,6 +1706,12 @@ Write-BannerLine 'OS:'           $Global:WinInfo.Name           $BoldWhite
 Write-BannerLine 'Build:'        $Global:WinInfo.BuildNumber    $BoldWhite
 Write-BannerLine 'PowerShell:'   $Global:WinInfo.PSVersion      $BoldWhite
 Write-BannerLine 'Architecture:' $Global:WinInfo.Architecture   $BoldWhite
+if ($Is32on64) {
+    Write-BannerLine 'PS arch:'       '32-bit ⚠ (x86 on x64)'    $Yellow
+} else {
+    $psArch = if ([Environment]::Is64BitProcess) { '64-bit' } else { '32-bit' }
+    Write-BannerLine 'PS arch:'       $psArch                     $DimGray
+}
 
 # -- Empty separator --
 Write-Host "$BoldBlue│$Reset$(' ' * $innerWidth)$BoldBlue│$Reset"
@@ -1530,6 +1727,25 @@ Write-BannerLine 'Skip MTU test:' $NoMtuTest.ToString()               $(if($NoMt
 Write-BannerLine 'Silent mode:'   $Silent.ToString()                  $(if($Silent){$Yellow}else{$DimGray})
 Write-Host "$BoldBlue╰$('─' * $innerWidth)╯$Reset"
 Write-Host ''
+} else {
+    # --- Simple ASCII banner for non-VT terminals (ISE, Server 2012 R2) ---
+    Write-Host ''
+    Write-Host '=================================================='
+    Write-Host '  WINDOWS NETWORK OPTIMIZER  v3.1-dev'
+    Write-Host '  universal - Win 7 SP1+ / 8.1 / 10 / 11'
+    Write-Host '--------------------------------------------------'
+    Write-Host ('  OS:           ' + $Global:WinInfo.Name)
+    Write-Host ('  Build:        ' + $Global:WinInfo.BuildNumber)
+    Write-Host ('  PowerShell:   ' + $Global:WinInfo.PSVersion)
+    Write-Host ('  Architecture: ' + $Global:WinInfo.Architecture)
+    Write-Host ('  Mode:         ' + $Mode)
+    Write-Host ('  Telemetry off: ' + $DisableTelemetry.ToString())
+    Write-Host ('  Skip registry: ' + $NoRegistry.ToString())
+    Write-Host ('  Skip MTU test: ' + $NoMtuTest.ToString())
+    Write-Host ('  Silent mode:   ' + $Silent.ToString())
+    Write-Host '=================================================='
+    Write-Host ''
+}
 
 # --- Restore mode bypasses normal flow ---
 if ($Restore) {
@@ -1641,8 +1857,12 @@ if (-not $NoRegistry) {
     Set-TcpIpRegistryTweaks   -ModeName $Mode
     Write-Spinner 'Configuring per-interface Nagle settings...' 1
     Set-InterfaceNagleTweaks  -ModeName $Mode
-    Write-Spinner 'Optimizing MMCSS multimedia scheduler...' 1
-    Set-MmcssOptimization     -ModeName $Mode
+    if (-not $SkipMMCSS) {
+        Write-Spinner 'Optimizing MMCSS multimedia scheduler...' 1
+        Set-MmcssOptimization     -ModeName $Mode
+    } else {
+        Write-Skip 'MMCSS optimization skipped (32-bit PS on 64-bit OS)'
+    }
 } else {
     Write-Skip 'Registry tweaks skipped (-NoRegistry parameter)'
 }
@@ -1705,7 +1925,11 @@ Write-Summary 'Power Management: Windows device sleep disabled per adapter'
 Write-Summary 'TCP/IP global (netsh): 24 settings (autotuning, RSS, ECN, HyStart...)'
 if (-not $NoRegistry) {
     Write-Summary 'Registry TCP/IP: 16 stack performance values'
-    Write-Summary 'MMCSS: NetworkThrottlingIndex disabled, Games priority boosted'
+    if ($SkipMMCSS) {
+        Write-Summary 'MMCSS: SKIPPED (32-bit PS - run 64-bit PowerShell to apply)'
+    } else {
+        Write-Summary 'MMCSS: NetworkThrottlingIndex disabled, Games priority boosted'
+    }
     if ($Mode -ne 'Throughput') {
         Write-Summary 'Per-NIC Nagle OFF: TcpAckFrequency=1, TCPNoDelay=1 (lower ping)'
     }
@@ -1716,7 +1940,11 @@ if ($selectedDns) {
     Write-Summary "DNS configured: $($selectedDns.Name) ($($selectedDns.V4 -join ', '))"
 }
 if ($DisableTelemetry) {
-    Write-Summary 'Telemetry services disabled (DiagTrack, Delivery Optimization)'
+    if ($SkipDeliveryOpt) {
+        Write-Summary 'Telemetry services disabled (DiagTrack, WMP; DeliveryOpt SKIPPED - 32-bit PS)'
+    } else {
+        Write-Summary 'Telemetry services disabled (DiagTrack, Delivery Optimization)'
+    }
 }
 
 Write-Host ''
@@ -1733,7 +1961,8 @@ if (-not $Silent) { Read-Host 'Press Enter to exit' }
 # are silently recorded in $Error. Warn the user if any occurred
 # during the optimization run so they can review the output for
 # ◆ warn / ● error markers.
-if ($Error.Count -gt 0) {
-    Write-Warn "Optimization completed but $($Error.Count) non-terminating error(s) were recorded in `$Error"
+$newErrors = $Error.Count - $ScriptStartErrorCount
+if ($newErrors -gt 0) {
+    Write-Warn "Optimization completed but $newErrors non-terminating error(s) were recorded in `$Error"
     Write-Warn 'Review output above for ◆ (yellow diamond warning) and ● (red circle error) markers to identify failed settings'
 }

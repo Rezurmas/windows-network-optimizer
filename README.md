@@ -108,7 +108,7 @@ DNS4EU, Mullvad, AliDNS for China, etc.) - all interactive, with rollback suppor
 Run-NIC-Optimizer.bat
 ```
 
-Auto-elevates via UAC and shows a 7-option menu.
+Auto-elevates via UAC. **Pick [1] Interactive** for full menu (mode → adapter → DNS), or use shortcuts [2]-[5] for quick launch.
 
 </td><td>
 
@@ -119,7 +119,7 @@ Auto-elevates via UAC and shows a 7-option menu.
 .\Optimize-NetworkAdapter.ps1
 ```
 
-Interactive: pick adapter -> pick DNS -> done.
+Fully interactive: built-in mode selector (Throughput/LowLatency/Balanced/FULL MAX) → pick adapter → pick DNS → done.
 
 </td></tr>
 </table>

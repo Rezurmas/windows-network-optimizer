@@ -79,8 +79,8 @@
 .NOTES
     Author:   Open source community contribution
     License:  MIT
-    Version:  3.0
-    Updated:  2026
+    Version:  4.0
+    Updated:  2026 — 29 AI-agent audited
 
     REBOOT REQUIRED after first run for full effect.
 #>

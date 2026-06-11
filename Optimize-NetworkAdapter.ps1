@@ -126,6 +126,9 @@ param(
     [switch]$Silent
 )
 
+# 'Continue' is used instead of 'Stop' so the script can apply as many
+# optimizations as possible — a single failed setting (e.g. unsupported
+# by a specific NIC vendor) should not abort the entire optimization run.
 $ErrorActionPreference = 'Continue'
 $BackupDir = Join-Path $env:USERPROFILE 'Desktop\NIC-Backup'
 
@@ -135,89 +138,181 @@ $BackupDir = Join-Path $env:USERPROFILE 'Desktop\NIC-Backup'
 #   for instant visual scanning of logs.
 # ============================================================
 
-# Section header - cyan box that visually separates phases
+# Section header - bold cyan Unicode box that visually separates phases
+#   ╭──────────────────────────────────────────────────────────╮
+#   │             PHASE 1: PER-ADAPTER OPTIMIZATION            │
+#   ╰──────────────────────────────────────────────────────────╯
 function Write-Section {
     param([string]$title)
-    $width = 64
-    $border = '+' + ('=' * ($width - 2)) + '+'
-    $padded = '  ' + $title
-    if ($padded.Length -lt ($width - 2)) {
-        $padded = $padded.PadRight($width - 2)
-    }
+    $width = 58
+    $inner = $width - 2                               # space for side borders
+    $side  = [char]0x2502                             # │
     Write-Host ''
-    Write-Host $border -ForegroundColor DarkCyan
-    Write-Host ('|' + $padded + '|') -ForegroundColor Cyan
-    Write-Host $border -ForegroundColor DarkCyan
+    # Top border:   ╭────...────╮
+    Write-Host ('  ' + [char]0x256D + ([char]0x2500 * $inner) + [char]0x256E) -ForegroundColor Cyan
+    # Title:  │  centered-title  │  — bold white title on cyan borders
+    $padTotal = $inner - 2 - $title.Length            # -2 for spaces between │ and text
+    if ($padTotal -lt 0) { $padTotal = 0 }
+    $leftPad  = [Math]::Floor($padTotal / 2)
+    $rightPad = $padTotal - $leftPad
+    Write-Host ('  ' + $side + ' ') -NoNewline -ForegroundColor Cyan
+    Write-Host (' ' * $leftPad) -NoNewline
+    Write-GradientText -Text $title -NoNewline
+    Write-Host (' ' * $rightPad + ' ') -NoNewline -ForegroundColor Cyan
+    Write-Host $side -ForegroundColor Cyan
+    # Bottom border:   ╰────...────╯
+    Write-Host ('  ' + [char]0x2570 + ([char]0x2500 * $inner) + [char]0x256F) -ForegroundColor Cyan
 }
 
-# Sub-header inside a section (smaller, single-line)
+# Sub-header inside a section — dimmed line with bold white title
+#   ──── DNS Selection ────
 function Write-SubSection {
     param([string]$title)
     Write-Host ''
-    Write-Host "  --- $title ---" -ForegroundColor DarkCyan
+    Write-Host '  ' -NoNewline
+    Write-Host ([char]0x2500 * 4) -NoNewline -ForegroundColor DarkGray
+    Write-Host " $title " -NoNewline -ForegroundColor White
+    Write-Host ([char]0x2500 * 4) -ForegroundColor DarkGray
 }
 
-# [ OK ]  green - operation succeeded
+# Thin dimmed divider line — separates sub-sections without fanfare
+#   ─────────────────────────────────────────────────
+function Write-MiniDivider {
+    Write-Host ('  ' + [char]0x2500 * 54) -ForegroundColor DarkGray
+}
+
+# Spinner animation — shows a rotating symbol for a given duration.
+# Useful to indicate that a long phase has started and is in progress.
+# Frames: · ✻ ✽ ✶ ✳ ✢   at 80ms intervals (smooth 12.5 fps).
+# Clears the line on completion so output is not cluttered.
+function Write-Spinner {
+    param(
+        [string]$Message,
+        [int]$Duration = 2
+    )
+    $frames = @('·', '✻', '✽', '✶', '✳', '✢')
+    $esc    = [char]27
+    $start  = Get-Date
+    $i      = 0
+    while (((Get-Date) - $start).TotalSeconds -lt $Duration) {
+        $frame = $frames[$i % $frames.Count]
+        Write-Host ("`r$esc[2K  $frame  $Message") -NoNewline -ForegroundColor Cyan
+        Start-Sleep -Milliseconds 80
+        $i++
+    }
+    # Clear the spinner line so subsequent output appears cleanly
+    Write-Host "`r$esc[2K" -NoNewline
+}
+
+# Pulsing dot animation — shows growing/shrinking dots during slow operations.
+# Used primarily for the MTU detection phase (~30s binary search).
+function Write-PulseDot {
+    param(
+        [string]$Label,
+        [int]$Step
+    )
+    $esc     = [char]27
+    $pattern = $Step % 4
+    $dots    = switch ($pattern) {
+        0 { '·' }
+        1 { '· ·' }
+        2 { '· · ·' }
+        3 { '· ·' }
+    }
+    Write-Host ("`r$esc[2K  ◌  $Label $dots") -NoNewline -ForegroundColor DarkGray
+}
+
+# ● green  = success (replaces [ OK ])
 function Write-OK {
     param([string]$m)
-    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
-    Write-Host 'OK ' -NoNewline -ForegroundColor Green
-    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
+    Write-Host '●' -NoNewline -ForegroundColor Green
+    Write-Host '  ' -NoNewline
     Write-Host $m -ForegroundColor White
 }
 
-# [APLY]  cyan - applying a change (before/after value)
+# ○ cyan   = applying (replaces [ +> ])
 function Write-Apply {
     param([string]$m)
-    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
-    Write-Host '+> ' -NoNewline -ForegroundColor Cyan
-    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
+    Write-Host '○' -NoNewline -ForegroundColor Cyan
+    Write-Host '  ' -NoNewline
     Write-Host $m -ForegroundColor Cyan
 }
 
-# [WARN]  yellow - operation failed but non-critical
+# ◆ yellow = warning (replaces [ !! ])
 function Write-Warn {
     param([string]$m)
-    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
-    Write-Host '!! ' -NoNewline -ForegroundColor Yellow
-    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
+    Write-Host '◆' -NoNewline -ForegroundColor Yellow
+    Write-Host '  ' -NoNewline
     Write-Host $m -ForegroundColor Yellow
 }
 
-# [ERR ]  red - operation failed critically
+# ● red    = error (replaces [ XX ])
 function Write-Err {
     param([string]$m)
-    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
-    Write-Host 'XX ' -NoNewline -ForegroundColor Red
-    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
+    Write-Host '●' -NoNewline -ForegroundColor Red
+    Write-Host '  ' -NoNewline
     Write-Host $m -ForegroundColor Red
 }
 
-# [INFO]  gray - informational, neither success nor failure
+# ◉ darkgray = info (replaces [ .. ])
 function Write-Info {
     param([string]$m)
-    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
-    Write-Host '.. ' -NoNewline -ForegroundColor DarkGray
-    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
+    Write-Host '◉' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
     Write-Host $m -ForegroundColor Gray
 }
 
-# [SKIP]  dark gray - skipped (already optimal or unsupported)
+# ◌ gray   = skipped (replaces [ -- ])
 function Write-Skip {
     param([string]$m)
-    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
-    Write-Host '-- ' -NoNewline -ForegroundColor DarkGray
-    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
+    Write-Host '◌' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
     Write-Host $m -ForegroundColor DarkGray
 }
 
-# [TIP ]  magenta - hint or tip for the user
+# ✦ magenta = tip (replaces [ ?? ])
 function Write-Tip {
     param([string]$m)
-    Write-Host '  [ ' -NoNewline -ForegroundColor DarkGray
-    Write-Host '?? ' -NoNewline -ForegroundColor Magenta
-    Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
+    Write-Host '  ' -NoNewline
+    Write-Host '✦' -NoNewline -ForegroundColor Magenta
+    Write-Host '  ' -NoNewline
     Write-Host $m -ForegroundColor Magenta
+}
+
+# Gradient per-character color interpolation for eye-catching titles
+# Default colors: warm orange (R=217,G=119,B=6) → bright orange (R=245,G=158,B=11)
+function Write-GradientText {
+    param([string]$Text, [int]$R1=217, [int]$G1=119, [int]$B1=6,
+          [int]$R2=245, [int]$G2=158, [int]$B2=11,
+          [switch]$NoNewline)
+    $esc = [char]27
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+        $t = if ($Text.Length -gt 1) { $i / ($Text.Length - 1) } else { 0 }
+        $r = [Math]::Round($R1 + ($R2 - $R1) * $t)
+        $g = [Math]::Round($G1 + ($G2 - $G1) * $t)
+        $b = [Math]::Round($B1 + ($B2 - $B1) * $t)
+        Write-Host -NoNewline "$esc[38;2;$r;$g;${b}m$($Text[$i])"
+    }
+    if ($NoNewline) {
+        Write-Host -NoNewline "$esc[0m"
+    } else {
+        Write-Host "$esc[0m"
+    }
+}
+
+# Progress bar for multi-adapter optimization loop
+function Write-ProgressBar {
+    param([int]$Percent, [int]$Width=40, [int]$R=217, [int]$G=119, [int]$B=6)
+    $esc = [char]27
+    $filled = [Math]::Floor($Percent / 100 * $Width)
+    $empty = $Width - $filled
+    Write-Host -NoNewline "`r  $esc[38;2;$R;$G;${B}m$('█' * $filled)$esc[2m$('░' * $empty)$esc[0m $Percent%"
 }
 
 # ============================================================
@@ -261,7 +356,7 @@ if (-not $isAdmin) {
     Write-Err 'This script requires Administrator privileges!'
     Write-Info 'Run via Run-NIC-Optimizer.bat (auto-elevates) or open PowerShell as Administrator'
     if (-not $Silent) { Read-Host 'Press Enter to exit' }
-    exit 1
+    return
 }
 
 # Warn if older Windows (pre Win 8.1) - some cmdlets unavailable
@@ -271,7 +366,14 @@ if ($Global:WinInfo.BuildNumber -lt 9600) {
     Write-Info 'Script will use netsh/WMI fallbacks where possible'
     if (-not $Silent) {
         $cont = Read-Host 'Continue anyway? (Y/N)'
-        if ($cont -notmatch '^[YyTt]') { exit 0 }
+        if ($cont -notmatch '^[YyTt]') { return }
+    }
+    # Even if user confirmed, exit gracefully if Get-NetAdapter is completely unavailable
+    if (-not $Global:WinInfo.SupportsNetAdapter) {
+        Write-Err "Get-NetAdapter is not available on $($Global:WinInfo.Name) (requires Win 8.1+ / Server 2012 R2+)"
+        Write-Err 'This script cannot function without Get-NetAdapter. Exiting.'
+        if (-not $Silent) { Read-Host 'Press Enter to exit' }
+        return
     }
 }
 
@@ -485,7 +587,7 @@ function Resolve-DnsProvider {
     if ($InputValue -match '^[\d\.,:a-fA-F\s]+$') {
         $ips = $InputValue -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
         $v4 = $ips | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' }
-        $v6 = $ips | Where-Object { $_ -match ':' }
+        $v6 = $ips | Where-Object { $_ -match '^[0-9a-fA-F:]+:[0-9a-fA-F:]+$' }
         return [PSCustomObject]@{
             Id=999; Cat='Custom'; Name='Custom DNS'; V4=$v4; V6=$v6; Desc='User-provided DNS addresses'
         }
@@ -519,7 +621,7 @@ function Get-OptimalSettings {
         # === FLOW CONTROL & RSS (Receive Side Scaling) ===
         # Flow Control: pause frames prevent buffer overflow.
         # RSS: distributes incoming packets across multiple CPU cores.
-        @{ Pattern = '^Flow Control$|Sterowanie przeplywem';                Value = 'Rx & Tx Enabled' }
+        @{ Pattern = '^Flow Control$|Sterowanie przeplywem$';                Value = 'Rx & Tx Enabled' }
         @{ Pattern = 'Receive Side Scaling$|^RSS$';                         Value = 'Enabled' }
         @{ Pattern = 'Maximum Number of RSS Queues|RSS Queues';             Value = '4 Queues' }
         @{ Pattern = 'NetworkDirect|RDMA';                                  Value = 'Enabled' }
@@ -558,7 +660,31 @@ function Get-OptimalSettings {
         @{ Pattern = 'Selective Suspend';                                   Value = 'Disabled' }
         @{ Pattern = 'System Idle Power Saver';                             Value = 'Disabled' }
         @{ Pattern = 'Reduce Speed On Power Down';                          Value = 'Disabled' }
-        @{ Pattern = 'Power Down PHY|Shutdown Wake.On.Lan';                 Value = 'Disabled' }
+        @{ Pattern = 'Power Down PHY|Shutdown Wake\.On\.Lan';                 Value = 'Disabled' }
+
+        # === VENDOR-SPECIFIC POWER SAVING FEATURES (always disable) ===
+        # Realtek: Idle power saving drops link speed when idle -> disable
+        @{ Pattern = 'Idle Power Saving';                                      Value = 'Disabled' }
+        # Realtek: Auto-disable PCIe link can cause reconnect delays
+        @{ Pattern = 'Auto Disable PCIe|Auto Disable PCI Express';             Value = 'Disabled' }
+
+        # === KILLER NETWORKING "GAMING" FEATURES (disable — cause lag) ===
+        # Killer Advanced Stream Detect = QoS-like packet prioritization that
+        # often prioritizes the wrong traffic, causing jitter and bufferbloat.
+        @{ Pattern = 'Advanced Stream Detect';                                 Value = 'Disabled' }
+        # Killer GameFast = proprietary fast-path that interferes with Windows
+        # native TCP stack optimizations. Safer off.
+        @{ Pattern = 'GameFast';                                               Value = 'Disabled' }
+
+        # === BROADCOM / INTEL SERVER NIC VIRTUALIZATION ===
+        # VMQ = Virtual Machine Queues — distributes VM traffic across cores
+        @{ Pattern = 'Virtualization|VMQ|Virtual Machine Queues';              Value = 'Enabled' }
+        # SR-IOV = Single Root I/O Virtualization — direct NIC access for VMs
+        @{ Pattern = 'SR-IOV';                                                 Value = 'Enabled' }
+
+        # === INTEL GIGABIT MASTER/SLAVE MODE ===
+        # Auto Detect is safest — lets NIC negotiate role with switch
+        @{ Pattern = 'Gigabit Master Slave Mode';                              Value = 'Auto Detect' }
     )
 
     # === MODE-SPECIFIC SETTINGS ===
@@ -574,6 +700,9 @@ function Get-OptimalSettings {
             @{ Pattern = '^Interrupt Moderation$';                          Value = 'Enabled' }
             @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Adaptive' }
             @{ Pattern = 'Adaptive Inter.Frame Spacing';                    Value = 'Disabled' }
+            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Enabled' }
+            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Adaptive' }
+            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Enabled' }
         )
     }
     elseif ($ModeName -eq 'LowLatency') {
@@ -588,6 +717,9 @@ function Get-OptimalSettings {
             @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Off' }
             @{ Pattern = 'Adaptive Inter.Frame Spacing';                    Value = 'Disabled' }
             @{ Pattern = 'Priority.+VLAN.+Tag';                             Value = 'Priority Enabled' }
+            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Disabled' }
+            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Off' }
+            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Disabled' }
         )
     }
     else {
@@ -599,6 +731,9 @@ function Get-OptimalSettings {
             @{ Pattern = 'Recv Segment Coalescing \(IPv6\)';                Value = 'Enabled' }
             @{ Pattern = '^Interrupt Moderation$';                          Value = 'Enabled' }
             @{ Pattern = 'Interrupt Moderation Rate';                       Value = 'Adaptive' }
+            @{ Pattern = 'Interrupt Moderation Mode';                    Value = 'Enabled' }
+            @{ Pattern = 'ITR|Interrupt Throttle Rate';                  Value = 'Adaptive' }
+            @{ Pattern = 'Adaptive Interrupt Moderation';                Value = 'Enabled' }
         )
     }
 
@@ -639,10 +774,22 @@ function Backup-AdapterSettings {
              Select-Object Name, DisplayName, DisplayValue, RegistryKeyword, RegistryValue, ValidDisplayValues
 
     if ($props) {
-        $props | ConvertTo-Json -Depth 6 | Set-Content -Path $file -Encoding UTF8
-        Write-OK "Backup saved: $file"
+        # Store adapter name inside the JSON so restore can recover it exactly
+        $backupData = [PSCustomObject]@{
+            AdapterName = $adapterName
+            BackupStamp = $stamp
+            Properties  = @($props)
+        }
+        $backupData | ConvertTo-Json -Depth 6 | Set-Content -Path $file -Encoding UTF8
+        if (Test-Path $file) {
+            Write-OK "Backup saved: $file"
+        } else {
+            Write-Err "Failed to write backup file: $file"
+            return $null
+        }
     } else {
         Write-Warn 'No advanced properties to backup (basic adapter)'
+        return $null
     }
     return $file
 }
@@ -652,7 +799,11 @@ function Backup-AdapterSettings {
 function Optimize-Adapter {
     param([string]$adapterName)
     Write-Section "OPTIMIZING ADAPTER:  $adapterName"
-    Backup-AdapterSettings $adapterName | Out-Null
+    $backupPath = Backup-AdapterSettings $adapterName
+    if (-not $backupPath) {
+        Write-Err "Backup failed for adapter '$adapterName' — aborting optimization for this adapter"
+        return
+    }
 
     $props = Get-NetAdapterAdvancedProperty -Name $adapterName -ErrorAction SilentlyContinue
     if (-not $props) {
@@ -973,7 +1124,7 @@ function Set-MmcssOptimization {
     $tweaks = @(
         # 0xFFFFFFFF as DWord = -1 (signed int32, same bit pattern)
         # This is THE KEY TWEAK - removes network packet throttling entirely.
-        @{ Path=$sysProfile; Name='NetworkThrottlingIndex';   Value=([int]-1);  Type='DWord'; Desc='NetworkThrottlingIndex = 0xFFFFFFFF  [DISABLES network throttling]' }
+        @{ Path=$sysProfile; Name='NetworkThrottlingIndex';   Value=4294967295; Type='DWord'; Desc='NetworkThrottlingIndex = 0xFFFFFFFF  [DISABLES network throttling]' }
         @{ Path=$sysProfile; Name='SystemResponsiveness';     Value=$sysResp;   Type='DWord'; Desc="SystemResponsiveness = $sysResp  [% CPU reserved for non-multimedia tasks]" }
 
         # Boost for tasks classified as 'Games' (DirectX games auto-register)
@@ -1137,10 +1288,13 @@ function Test-OptimalMtu {
     Write-Info "Testing against: $target"
 
     $low = 1300; $high = 1500; $best = 0
+    $mtuStep = 0
     while ($low -le $high) {
         $mid = [int](($low + $high) / 2)
+        Write-PulseDot "Testing MTU payload size: $mid bytes" $mtuStep
         # -f sets Don't Fragment bit, -l sets payload size, -n 1 = one ping
         $null = ping.exe -f -l $mid -n 1 -w 1500 $target 2>&1
+        $mtuStep++
         # FIX: Use exit code instead of 'Reply from' string (locale-independent)
         if ($LASTEXITCODE -eq 0) {
             $best = $mid
@@ -1149,6 +1303,7 @@ function Test-OptimalMtu {
             $high = $mid - 1
         }
     }
+    Write-Host ''  # end pulse-dot line
     if ($best -gt 0) {
         $optimalMtu = $best + 28  # +20 IP header + 8 ICMP header = 28 bytes overhead
         Write-OK "Optimal MTU detected: $optimalMtu  (max ICMP payload: $best bytes)"
@@ -1214,12 +1369,39 @@ function Restore-FromBackup {
         return
     }
 
-    $file        = $backups[[int]$idx].FullName
-    $data        = Get-Content $file -Raw | ConvertFrom-Json
-    $adapterName = ($backups[[int]$idx].BaseName -replace '--\d{8}-\d{6}$', '') -replace '_', ' '
+    # Validate index: must be numeric and within bounds
+    if ($idx -notmatch '^\d+$') {
+        Write-Err "Invalid backup number: '$idx' (must be 0-$($backups.Count - 1))"
+        return
+    }
+    $idxNum = [int]$idx
+    if ($idxNum -lt 0 -or $idxNum -ge $backups.Count) {
+        Write-Err "Backup number out of range: $idxNum (valid: 0-$($backups.Count - 1))"
+        return
+    }
+
+    $file        = $backups[$idxNum].FullName
+    try {
+        $rawJson = Get-Content $file -Raw -ErrorAction Stop
+        $data    = $rawJson | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-Err "Failed to read/parse backup file '$file': $($_.Exception.Message)"
+        return
+    }
+
+    # Extract adapter name from JSON (new format) or fall back to filename (old format)
+    if ($data.AdapterName) {
+        $adapterName = $data.AdapterName
+        $propsData   = $data.Properties
+    } else {
+        # Old-format backup: adapter name was encoded in filename
+        $adapterName = $backups[$idxNum].BaseName -replace '--\d{8}-\d{6}$', ''
+        $propsData   = $data
+        Write-Warn 'Old-format backup detected (adapter name may be inaccurate for names with underscores)'
+    }
 
     Write-Info "Restoring to adapter: $adapterName"
-    foreach ($p in $data) {
+    foreach ($p in $propsData) {
         try {
             Set-NetAdapterAdvancedProperty -Name $adapterName -DisplayName $p.DisplayName `
                 -DisplayValue $p.DisplayValue -NoRestart -ErrorAction Stop
@@ -1235,6 +1417,12 @@ function Restore-FromBackup {
 # ============================================================
 #   MAIN EXECUTION FLOW
 #
+#   Wrapped in a dot-source guard: when the script is invoked
+#   directly (.\Optimize-NetworkAdapter.ps1) $MyInvocation.InvocationName
+#   is not '.' so the block runs. When dot-sourced for library use
+#   (. .\Optimize-NetworkAdapter.ps1) the block is skipped, allowing
+#   safe import of functions/constants without side effects.
+#
 #   Phase 1: Per-adapter optimization (settings + power mgmt + DNS)
 #   Phase 2: Global TCP/IP tuning (netsh)
 #   Phase 3: Registry tweaks (TCP stack, Nagle, MMCSS) - optional
@@ -1242,54 +1430,106 @@ function Restore-FromBackup {
 #   Phase 5: Telemetry off - optional
 #   Phase 6: MTU auto-detection - informational
 # ============================================================
+function Write-AsciiArt {
+    param([string]$Mode)
+
+    $color = switch ($Mode) {
+        'Throughput' { 'Green' }
+        'LowLatency' { 'Magenta' }
+        'Balanced'   { 'Yellow' }
+        default      { 'White' }
+    }
+
+    switch ($Mode) {
+        'Throughput' {
+            Write-Host '       ⚡ ⚡ ⚡' -ForegroundColor $color
+            Write-Host '    ┌──────────┐' -ForegroundColor $color
+            Write-Host '  ══╡  ██████  ╞══  MAX BANDWIDTH' -ForegroundColor $color
+            Write-Host '    └──────────┘' -ForegroundColor $color
+            Write-Host '       │ │ │' -ForegroundColor $color
+        }
+        'LowLatency' {
+            Write-Host '    ▄▄▄  ▄▄▄' -ForegroundColor $color
+            Write-Host '   ████████████' -ForegroundColor $color
+            Write-Host '   ████████████  MIN PING' -ForegroundColor $color
+            Write-Host '    ▀▀▀  ▀▀▀' -ForegroundColor $color
+        }
+        'Balanced' {
+            Write-Host '       ⚖' -ForegroundColor $color
+            Write-Host '    ┌──┴──┐' -ForegroundColor $color
+            Write-Host '    │  ██  │   BALANCED' -ForegroundColor $color
+            Write-Host '    └─────┘' -ForegroundColor $color
+        }
+    }
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
 Clear-Host
 
-# --- Multi-color banner ---
-$bannerBorder = '+' + ('=' * 66) + '+'
+Write-AsciiArt -Mode $Mode
 Write-Host ''
-Write-Host $bannerBorder -ForegroundColor DarkCyan
-Write-Host '|         ' -NoNewline -ForegroundColor DarkCyan
-Write-Host 'WINDOWS NETWORK OPTIMIZER  v3.0' -NoNewline -ForegroundColor White
-Write-Host '                            |' -ForegroundColor DarkCyan
-Write-Host '|         ' -NoNewline -ForegroundColor DarkCyan
-Write-Host 'universal - Win 8.1 / 10 / 11 / Server 2012R2+' -NoNewline -ForegroundColor Cyan
-Write-Host '             |' -ForegroundColor DarkCyan
-Write-Host $bannerBorder -ForegroundColor DarkCyan
 
-function Write-BannerLine { param($k, $v, $vc='White')
-    Write-Host '|  ' -NoNewline -ForegroundColor DarkCyan
-    Write-Host ($k.PadRight(18)) -NoNewline -ForegroundColor Gray
-    Write-Host ($v.PadRight(46)) -NoNewline -ForegroundColor $vc
-    Write-Host '|' -ForegroundColor DarkCyan
+# --- Claude Code style ANSI truecolor banner ---
+$esc = [char]27
+$BoldBlue    = "$esc[1;38;2;59;130;246m"
+$BoldWhite   = "$esc[1;37m"
+$Orange      = "$esc[1;38;2;217;119;6m"
+$Gold        = "$esc[38;2;245;158;11m"
+$DimGray     = "$esc[2;37m"
+$White       = "$esc[37m"
+$Green       = "$esc[1;32m"
+$Magenta     = "$esc[1;35m"
+$Yellow      = "$esc[1;33m"
+$Reset       = "$esc[0m"
+
+$innerWidth = 50
+
+function Write-BannerLine { param($k, $v, $vc=$White)
+    $vPad = 30
+    if ($v -isnot [string]) { $v = $v.ToString() }
+    $vStr = if ($v.Length -gt $vPad) { $v.Substring(0, $vPad) } else { $v.PadRight($vPad) }
+    Write-Host "$BoldBlue│$Reset  $DimGray$($k.PadRight(18))$Reset$vc$vStr$Reset$BoldBlue│$Reset"
 }
 
-Write-BannerLine 'OS:'           $Global:WinInfo.Name           'White'
-Write-BannerLine 'Build:'        $Global:WinInfo.BuildNumber    'White'
-Write-BannerLine 'PowerShell:'   $Global:WinInfo.PSVersion      'White'
-Write-BannerLine 'Architecture:' $Global:WinInfo.Architecture   'White'
-Write-Host '|' -NoNewline -ForegroundColor DarkCyan
-Write-Host (' ' * 66) -NoNewline
-Write-Host '|' -ForegroundColor DarkCyan
+Write-Host ''
+# -- Top box: title + subtitle --
+$title    = 'WINDOWS NETWORK OPTIMIZER  v3.0'
+$subtitle = 'universal · Win 7 SP1+ / 8.1 / 10 / 11'
+$tPad = $innerWidth - $title.Length;    $tL = [Math]::Floor($tPad/2); $tR = $tPad - $tL
+$sPad = $innerWidth - $subtitle.Length; $sL = [Math]::Floor($sPad/2); $sR = $sPad - $sL
 
-$modeColor = switch ($Mode) {
-    'Throughput' { 'Green' }
-    'LowLatency' { 'Magenta' }
-    'Balanced'   { 'Yellow' }
-    default      { 'White' }
-}
-Write-BannerLine 'Mode:'         $Mode                                $modeColor
-Write-BannerLine 'Telemetry off:' $DisableTelemetry.ToString()        $(if($DisableTelemetry){'Yellow'}else{'DarkGray'})
-Write-BannerLine 'Skip registry:' $NoRegistry.ToString()              $(if($NoRegistry){'Yellow'}else{'DarkGray'})
-Write-BannerLine 'Skip MTU test:' $NoMtuTest.ToString()               $(if($NoMtuTest){'Yellow'}else{'DarkGray'})
-Write-BannerLine 'Silent mode:'   $Silent.ToString()                  $(if($Silent){'Yellow'}else{'DarkGray'})
-Write-Host $bannerBorder -ForegroundColor DarkCyan
+Write-Host "$BoldBlue╭$('─' * $innerWidth)╮$Reset"
+Write-Host "$BoldBlue│$Reset$(' ' * $tL)$BoldWhite$title$Reset$(' ' * $tR)$BoldBlue│$Reset"
+Write-Host "$BoldBlue│$Reset$(' ' * $sL)$Gold$subtitle$Reset$(' ' * $sR)$BoldBlue│$Reset"
+Write-Host "$BoldBlue╰$('─' * $innerWidth)╯$Reset"
+Write-Host ''
+
+# -- System info lines --
+Write-BannerLine 'OS:'           $Global:WinInfo.Name           $BoldWhite
+Write-BannerLine 'Build:'        $Global:WinInfo.BuildNumber    $BoldWhite
+Write-BannerLine 'PowerShell:'   $Global:WinInfo.PSVersion      $BoldWhite
+Write-BannerLine 'Architecture:' $Global:WinInfo.Architecture   $BoldWhite
+
+# -- Empty separator --
+Write-Host "$BoldBlue│$Reset$(' ' * $innerWidth)$BoldBlue│$Reset"
+
+# -- Mode with gradient text --
+Write-Host "$BoldBlue│$Reset  $DimGray$('Mode:'.PadRight(18))$Reset" -NoNewline
+Write-GradientText -Text $Mode -NoNewline
+Write-Host (' ' * (30 - $Mode.Length)) -NoNewline
+Write-Host "$BoldBlue│$Reset"
+Write-BannerLine 'Telemetry off:' $DisableTelemetry.ToString()        $(if($DisableTelemetry){$Yellow}else{$DimGray})
+Write-BannerLine 'Skip registry:' $NoRegistry.ToString()              $(if($NoRegistry){$Yellow}else{$DimGray})
+Write-BannerLine 'Skip MTU test:' $NoMtuTest.ToString()               $(if($NoMtuTest){$Yellow}else{$DimGray})
+Write-BannerLine 'Silent mode:'   $Silent.ToString()                  $(if($Silent){$Yellow}else{$DimGray})
+Write-Host "$BoldBlue╰$('─' * $innerWidth)╯$Reset"
 Write-Host ''
 
 # --- Restore mode bypasses normal flow ---
 if ($Restore) {
     Restore-FromBackup
     if (-not $Silent) { Read-Host 'Press Enter to exit' }
-    exit
+    return
 }
 
 Show-Adapters
@@ -1299,14 +1539,20 @@ Show-Adapters
 # ============================================================
 if ($All) {
     $targets = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.MediaType -eq '802.3' }
-    if (-not $targets) { Write-Err 'No active Ethernet adapters found'; exit 1 }
+    if (-not $targets) { Write-Err 'No active Ethernet adapters found'; return }
     Write-Info "Selected $($targets.Count) Ethernet adapter(s) (all active)"
 } elseif ($AdapterName) {
-    $targets = Get-NetAdapter -Name $AdapterName -ErrorAction Stop
+    try {
+        $targets = Get-NetAdapter -Name $AdapterName -ErrorAction Stop
+    } catch {
+        Write-Err "Adapter '$AdapterName' not found: $($_.Exception.Message)"
+        if (-not $Silent) { Read-Host 'Press Enter to exit' }
+        return
+    }
 } elseif ($Silent) {
     # Silent mode without explicit name -> all active Ethernet
     $targets = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.MediaType -eq '802.3' }
-    if (-not $targets) { Write-Err 'No active Ethernet adapters found (silent mode)'; exit 1 }
+    if (-not $targets) { Write-Err 'No active Ethernet adapters found (silent mode)'; return }
 } else {
     Write-Host ''
     Write-Tip "Current mode: $Mode  (change with -Mode Throughput|LowLatency|Balanced)"
@@ -1314,14 +1560,20 @@ if ($All) {
     if ($name -eq 'all') {
         $targets = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.MediaType -eq '802.3' }
     } else {
-        $targets = Get-NetAdapter -Name $name -ErrorAction Stop
+        try {
+            $targets = Get-NetAdapter -Name $name -ErrorAction Stop
+        } catch {
+            Write-Err "Adapter '$name' not found: $($_.Exception.Message)"
+            if (-not $Silent) { Read-Host 'Press Enter to exit' }
+            return
+        }
     }
 }
 
 if (-not $targets) {
     Write-Err 'No adapter found'
     if (-not $Silent) { Read-Host 'Press Enter to exit' }
-    exit 1
+    return
 }
 
 # ============================================================
@@ -1353,7 +1605,15 @@ if ($PSBoundParameters.ContainsKey('DnsProvider')) {
 # ============================================================
 #   PHASE 1: PER-ADAPTER OPTIMIZATION
 # ============================================================
+$adapterIdx = 0; $adapterTotal = @($targets).Count
 foreach ($t in $targets) {
+    $adapterIdx++
+    if ($adapterTotal -gt 1) {
+        Write-Host ''
+        Write-ProgressBar -Percent ([Math]::Floor($adapterIdx / $adapterTotal * 100)) -Width 50
+        Write-Host "  Adapter $adapterIdx / $adapterTotal : $($t.Name)"
+    }
+    Write-Spinner "Preparing to optimize: $($t.Name)..." 1
     Optimize-Adapter         $t.Name
     Disable-PowerManagement  $t.Name
     if ($selectedDns) {
@@ -1364,14 +1624,18 @@ foreach ($t in $targets) {
 # ============================================================
 #   PHASE 2: GLOBAL TCP/IP TUNING (netsh)
 # ============================================================
+Write-Spinner 'Applying global TCP/IP netsh tuning...' 1
 Optimize-TcpIpGlobal -ModeName $Mode
 
 # ============================================================
 #   PHASE 3: REGISTRY TWEAKS (TCP stack + Nagle + MMCSS)
 # ============================================================
 if (-not $NoRegistry) {
+    Write-Spinner 'Applying TCP/IP registry tweaks...' 1
     Set-TcpIpRegistryTweaks   -ModeName $Mode
+    Write-Spinner 'Configuring per-interface Nagle settings...' 1
     Set-InterfaceNagleTweaks  -ModeName $Mode
+    Write-Spinner 'Optimizing MMCSS multimedia scheduler...' 1
     Set-MmcssOptimization     -ModeName $Mode
 } else {
     Write-Skip 'Registry tweaks skipped (-NoRegistry parameter)'
@@ -1380,13 +1644,16 @@ if (-not $NoRegistry) {
 # ============================================================
 #   PHASE 4: POWER MANAGEMENT (powercfg + Ultimate plan)
 # ============================================================
+Write-Spinner 'Applying powercfg deep power management...' 1
 Set-PowerCfgTweaks
+Write-Spinner 'Activating maximum performance power plan...' 1
 Set-PerformancePowerPlan
 
 # ============================================================
 #   PHASE 5: TELEMETRY OFF (opt-in only)
 # ============================================================
 if ($DisableTelemetry) {
+    Write-Spinner 'Stopping telemetry services...' 1
     Disable-TelemetryServices
 } else {
     Write-Info 'Telemetry was NOT disabled (use -DisableTelemetry to disable DiagTrack)'
@@ -1396,6 +1663,7 @@ if ($DisableTelemetry) {
 #   PHASE 6: MTU AUTO-DETECTION (informational)
 # ============================================================
 if (-not $NoMtuTest) {
+    Write-Spinner 'Starting MTU auto-detection...' 1
     Test-OptimalMtu
 } else {
     Write-Skip 'MTU test skipped (-NoMtuTest parameter)'
@@ -1419,30 +1687,30 @@ Show-Adapters
 
 # --- Color-coded summary of what was done ---
 Write-Section 'SUMMARY OF APPLIED OPTIMIZATIONS'
-function Write-Summary { param($status, $what)
+function Write-Summary { param([string]$what)
     Write-Host '  [' -NoNewline -ForegroundColor DarkGray
     Write-Host '+' -NoNewline -ForegroundColor Green
     Write-Host ']  ' -NoNewline -ForegroundColor DarkGray
     Write-Host $what -ForegroundColor White
 }
 
-Write-Summary 'OK' "Network adapter ($($targets.Count) interface): ~40 advanced settings tuned"
-Write-Summary 'OK' 'Power Management: Windows device sleep disabled per adapter'
-Write-Summary 'OK' 'TCP/IP global (netsh): 24 settings (autotuning, RSS, ECN, HyStart...)'
+Write-Summary "Network adapter ($($targets.Count) interface): ~40 advanced settings tuned"
+Write-Summary 'Power Management: Windows device sleep disabled per adapter'
+Write-Summary 'TCP/IP global (netsh): 24 settings (autotuning, RSS, ECN, HyStart...)'
 if (-not $NoRegistry) {
-    Write-Summary 'OK' 'Registry TCP/IP: 16 stack performance values'
-    Write-Summary 'OK' 'MMCSS: NetworkThrottlingIndex disabled, Games priority boosted'
+    Write-Summary 'Registry TCP/IP: 16 stack performance values'
+    Write-Summary 'MMCSS: NetworkThrottlingIndex disabled, Games priority boosted'
     if ($Mode -ne 'Throughput') {
-        Write-Summary 'OK' 'Per-NIC Nagle OFF: TcpAckFrequency=1, TCPNoDelay=1 (lower ping)'
+        Write-Summary 'Per-NIC Nagle OFF: TcpAckFrequency=1, TCPNoDelay=1 (lower ping)'
     }
 }
-Write-Summary 'OK' 'Powercfg: USB Suspend OFF, PCIe LSPM OFF, CPU min 100%'
-Write-Summary 'OK' 'Active power plan: Ultimate Performance (or High Performance)'
+Write-Summary 'Powercfg: USB Suspend OFF, PCIe LSPM OFF, CPU min 100%'
+Write-Summary 'Active power plan: Ultimate Performance (or High Performance)'
 if ($selectedDns) {
-    Write-Summary 'OK' "DNS configured: $($selectedDns.Name) ($($selectedDns.V4 -join ', '))"
+    Write-Summary "DNS configured: $($selectedDns.Name) ($($selectedDns.V4 -join ', '))"
 }
 if ($DisableTelemetry) {
-    Write-Summary 'OK' 'Telemetry services disabled (DiagTrack, Delivery Optimization)'
+    Write-Summary 'Telemetry services disabled (DiagTrack, Delivery Optimization)'
 }
 
 Write-Host ''
@@ -1452,3 +1720,14 @@ Write-Host '  Issues / Stars / PRs welcome!' -ForegroundColor DarkGray
 Write-Host ''
 
 if (-not $Silent) { Read-Host 'Press Enter to exit' }
+}  # end dot-source guard ($MyInvocation.InvocationName -ne '.')
+
+# --- Error summary check ---
+# Since $ErrorActionPreference = 'Continue', non-terminating errors
+# are silently recorded in $Error. Warn the user if any occurred
+# during the optimization run so they can review the output for
+# ◆ warn / ● error markers.
+if ($Error.Count -gt 0) {
+    Write-Warn "Optimization completed but $($Error.Count) non-terminating error(s) were recorded in `$Error"
+    Write-Warn 'Review output above for ◆ (yellow diamond warning) and ● (red circle error) markers to identify failed settings'
+}

@@ -17,13 +17,12 @@ desktop.ini
 .idea/
 
 # =====================================================
-# Temp / debug files
+# Temp / debug / conflict files
 # =====================================================
-_check.ps1
-_test*.ps1
 *.tmp
 *.log
 *.cache
+*.broken
 
 # =====================================================
 # Safety net - private files patterns
@@ -36,6 +35,16 @@ private/
 secrets.*
 .env
 .env.local
+
+# =====================================================
+# Binary / archive / installer files
+# =====================================================
+*.zip
+*.7z
+*.rar
+*.exe
+*.dll
+*.msi
 
 # =====================================================
 # PowerShell

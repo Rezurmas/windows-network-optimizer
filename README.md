@@ -2,7 +2,7 @@
 <!-- ANIMATED HEADER (capsule-render.vercel.app)                  -->
 <!-- ============================================================ -->
 <p align="center">
-  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:0EA5E9,50:8B5CF6,100:EC4899&height=220&section=header&text=Windows%20Network%20Optimizer&fontSize=50&fontColor=ffffff&animation=fadeIn&fontAlignY=38&desc=Universal%20%E2%80%A2%20Win%208.1%2F10%2F11%2FServer%202012R2%2B%20%E2%80%A2%20MIT&descAlignY=58&descSize=16" alt="banner" />
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:0EA5E9,50:8B5CF6,100:EC4899&height=220&section=header&text=Windows%20Network%20Optimizer&fontSize=50&fontColor=ffffff&animation=fadeIn&fontAlignY=38&desc=Universal%20%E2%80%A2%20Win%207%20SP1%2B%2F8%2F8.1%2F10%2F11%2FServer%202012%2B%20%E2%80%A2%20MIT&descAlignY=58&descSize=16" alt="banner" />
 </p>
 
 <!-- ============================================================ -->
@@ -56,7 +56,7 @@ DNS4EU, Mullvad, AliDNS for China, etc.) - all interactive, with rollback suppor
 > No bloat. No installer. No telemetry of its own. Just one `.ps1` and a `.bat` launcher.
 
 <p align="right">
-  <img src="https://img.shields.io/badge/-1454_lines-DarkSlateBlue?style=flat-square" />
+  <img src="https://img.shields.io/badge/-1733_lines-DarkSlateBlue?style=flat-square" />
   <img src="https://img.shields.io/badge/-Zero_dependencies-22C55E?style=flat-square" />
   <img src="https://img.shields.io/badge/-Auto--rollback-F59E0B?style=flat-square" />
 </p>
@@ -129,7 +129,7 @@ Interactive: pick adapter -> pick DNS -> done.
 ```powershell
 # Run as Administrator (downloads & runs latest release)
 iwr "https://raw.githubusercontent.com/Rezurmas/windows-network-optimizer/main/Optimize-NetworkAdapter.ps1" -OutFile $env:TEMP\opt.ps1
-& $env:TEMP\opt.ps1
+powershell -ExecutionPolicy Bypass -File $env:TEMP\opt.ps1
 ```
 
 ---
@@ -246,16 +246,16 @@ flowchart LR
 
 ## Console Output
 
-The script uses **7 distinct color-coded message types** for instant scanning:
+The script uses **7 distinct Unicode-symbol message types** for instant scanning:
 
 ```
-[ OK ]  green     - operation succeeded
-[ +> ]  cyan      - applying a change (before -> after)
-[ !! ]  yellow    - non-critical warning
-[ XX ]  red       - critical error
-[ .. ]  gray      - informational
-[ -- ]  dark gray - skipped (already optimal or unsupported)
-[ ?? ]  magenta   - tip / suggestion for user
+ ●   green     - operation succeeded
+ ○   cyan      - applying a change (before -> after)
+ ◆   yellow    - non-critical warning
+ ●   red       - critical error
+ ◉   gray      - informational
+ ◌   dark gray - skipped (already optimal or unsupported)
+ ✦   magenta   - tip / suggestion for user
 ```
 
 The startup banner is **mode-aware** - color changes based on whether you picked
@@ -340,7 +340,7 @@ Backups are stored at: `%USERPROFILE%\Desktop\NIC-Backup\<adapter>--<timestamp>.
 
 ```
 windows-network-optimizer/
-├── Optimize-NetworkAdapter.ps1   # Main script (1454 lines, ~50 functions)
+├── Optimize-NetworkAdapter.ps1   # Main script (1733 lines, ~50 functions)
 ├── Run-NIC-Optimizer.bat         # One-click launcher with UAC auto-elevation
 ├── README.md                     # This file
 ├── LICENSE                       # MIT
